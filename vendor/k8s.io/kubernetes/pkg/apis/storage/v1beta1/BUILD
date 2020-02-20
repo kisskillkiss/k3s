@@ -18,6 +18,7 @@ go_library(
     importpath = "k8s.io/kubernetes/pkg/apis/storage/v1beta1",
     deps = [
         "//pkg/apis/core:go_default_library",
+        "//pkg/apis/core/v1:go_default_library",
         "//pkg/apis/storage:go_default_library",
         "//pkg/features:go_default_library",
         "//staging/src/k8s.io/api/core/v1:go_default_library",
@@ -47,10 +48,7 @@ filegroup(
 
 go_test(
     name = "go_default_test",
-    srcs = [
-        "defaults_test.go",
-        "main_test.go",
-    ],
+    srcs = ["defaults_test.go"],
     embed = [":go_default_library"],
     deps = [
         "//pkg/api/legacyscheme:go_default_library",
@@ -59,6 +57,6 @@ go_test(
         "//staging/src/k8s.io/api/storage/v1beta1:go_default_library",
         "//staging/src/k8s.io/apimachinery/pkg/runtime:go_default_library",
         "//staging/src/k8s.io/apiserver/pkg/util/feature:go_default_library",
-        "//staging/src/k8s.io/apiserver/pkg/util/feature/testing:go_default_library",
+        "//staging/src/k8s.io/component-base/featuregate/testing:go_default_library",
     ],
 )

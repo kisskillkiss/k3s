@@ -29,17 +29,23 @@ import (
 	"net/http"
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	kubeoptions "k8s.io/kubernetes/cmd/kube-controller-manager/app/options"
 	"k8s.io/kubernetes/pkg/controller/certificates/approver"
 	"k8s.io/kubernetes/pkg/controller/certificates/cleaner"
+	"k8s.io/kubernetes/pkg/controller/certificates/rootcacertpublisher"
 	"k8s.io/kubernetes/pkg/controller/certificates/signer"
+	"k8s.io/kubernetes/pkg/features"
 )
 
 func startCSRSigningController(ctx ControllerContext) (http.Handler, bool, error) {
-	if !ctx.AvailableResources[schema.GroupVersionResource{Group: "certificates.k8s.io", Version: "v1beta1", Resource: "certificatesigningrequests"}] {
+	gvr := schema.GroupVersionResource{Group: "certificates.k8s.io", Version: "v1beta1", Resource: "certificatesigningrequests"}
+	if !ctx.AvailableResources[gvr] {
+		klog.Warningf("Resource %s is not available now", gvr.String())
 		return nil, false, nil
 	}
 	if ctx.ComponentConfig.CSRSigningController.ClusterSigningCertFile == "" || ctx.ComponentConfig.CSRSigningController.ClusterSigningKeyFile == "" {
+		klog.V(2).Info("skipping CSR signer controller because no csr cert/key was specified")
 		return nil, false, nil
 	}
 
@@ -74,6 +80,7 @@ func startCSRSigningController(ctx ControllerContext) (http.Handler, bool, error
 		// setting up the signing controller. This isn't
 		// actually a problem since the signer is not a
 		// required controller.
+		klog.V(2).Info("skipping CSR signer controller because no csr cert/key was specified and the default files are missing")
 		return nil, false, nil
 	default:
 		// Note that '!filesExist && !usesDefaults' is obviously
@@ -99,7 +106,9 @@ func startCSRSigningController(ctx ControllerContext) (http.Handler, bool, error
 }
 
 func startCSRApprovingController(ctx ControllerContext) (http.Handler, bool, error) {
-	if !ctx.AvailableResources[schema.GroupVersionResource{Group: "certificates.k8s.io", Version: "v1beta1", Resource: "certificatesigningrequests"}] {
+	gvr := schema.GroupVersionResource{Group: "certificates.k8s.io", Version: "v1beta1", Resource: "certificatesigningrequests"}
+	if !ctx.AvailableResources[gvr] {
+		klog.Warningf("Resource %s is not available now", gvr.String())
 		return nil, false, nil
 	}
 
@@ -122,5 +131,31 @@ func startCSRCleanerController(ctx ControllerContext) (http.Handler, bool, error
 }
 
 func startRootCACertPublisher(ctx ControllerContext) (http.Handler, bool, error) {
-	return nil, false, nil
+	if !utilfeature.DefaultFeatureGate.Enabled(features.BoundServiceAccountTokenVolume) {
+		return nil, false, nil
+	}
+
+	var (
+		rootCA []byte
+		err    error
+	)
+	if ctx.ComponentConfig.SAController.RootCAFile != "" {
+		if rootCA, err = readCA(ctx.ComponentConfig.SAController.RootCAFile); err != nil {
+			return nil, true, fmt.Errorf("error parsing root-ca-file at %s: %v", ctx.ComponentConfig.SAController.RootCAFile, err)
+		}
+	} else {
+		rootCA = ctx.ClientBuilder.ConfigOrDie("root-ca-cert-publisher").CAData
+	}
+
+	sac, err := rootcacertpublisher.NewPublisher(
+		ctx.InformerFactory.Core().V1().ConfigMaps(),
+		ctx.InformerFactory.Core().V1().Namespaces(),
+		ctx.ClientBuilder.ClientOrDie("root-ca-cert-publisher"),
+		rootCA,
+	)
+	if err != nil {
+		return nil, true, fmt.Errorf("error creating root CA certificate publisher: %v", err)
+	}
+	go sac.Run(1, ctx.Stop)
+	return nil, true, nil
 }

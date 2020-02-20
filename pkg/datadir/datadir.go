@@ -2,9 +2,10 @@ package datadir
 
 import (
 	"os"
+	"path/filepath"
 
 	"github.com/pkg/errors"
-	"github.com/rancher/norman/pkg/resolvehome"
+	"github.com/rancher/wrangler/pkg/resolvehome"
 )
 
 const (
@@ -15,8 +16,12 @@ const (
 )
 
 func Resolve(dataDir string) (string, error) {
+	return LocalHome(dataDir, false)
+}
+
+func LocalHome(dataDir string, forceLocal bool) (string, error) {
 	if dataDir == "" {
-		if os.Getuid() == 0 {
+		if os.Getuid() == 0 && !forceLocal {
 			dataDir = DefaultDataDir
 		} else {
 			dataDir = DefaultHomeDataDir
@@ -28,5 +33,5 @@ func Resolve(dataDir string) (string, error) {
 		return "", errors.Wrapf(err, "resolving %s", dataDir)
 	}
 
-	return dataDir, nil
+	return filepath.Abs(dataDir)
 }

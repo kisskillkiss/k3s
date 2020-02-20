@@ -3,40 +3,30 @@ package containerd
 import (
 	"context"
 	"fmt"
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/namespaces"
 	"io"
 	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
+	"github.com/containerd/containerd"
+	"github.com/containerd/containerd/namespaces"
 	"github.com/natefinch/lumberjack"
+	"github.com/opencontainers/runc/libcontainer/system"
+	"github.com/rancher/k3s/pkg/agent/templates"
 	util2 "github.com/rancher/k3s/pkg/agent/util"
 	"github.com/rancher/k3s/pkg/daemons/config"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
-	runtimeapi "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
+	yaml "gopkg.in/yaml.v2"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 	"k8s.io/kubernetes/pkg/kubelet/util"
 )
 
 const (
 	maxMsgSize = 1024 * 1024 * 16
-	configToml = `
-[plugins.opt]
-	path = "%OPT%"
-[plugins.cri]
-  stream_server_address = "%NODE%"
-  stream_server_port = "10010"
-`
-	configCNIToml = `
-  [plugins.cri.cni]
-    bin_dir = "%CNIBIN%"
-    conf_dir = "%CNICFG%"
-`
 )
 
 func Run(ctx context.Context, cfg *config.Node) error {
@@ -48,22 +38,12 @@ func Run(ctx context.Context, cfg *config.Node) error {
 		"--root", cfg.Containerd.Root,
 	}
 
-	template := configToml
-	if !cfg.NoFlannel {
-		template += configCNIToml
-	}
-
-	template = strings.Replace(template, "%OPT%", cfg.Containerd.Opt, -1)
-	template = strings.Replace(template, "%CNIBIN%", cfg.AgentConfig.CNIBinDir, -1)
-	template = strings.Replace(template, "%CNICFG%", cfg.AgentConfig.CNIConfDir, -1)
-	template = strings.Replace(template, "%NODE%", cfg.AgentConfig.NodeName, -1)
-
-	if err := util2.WriteFile(cfg.Containerd.Config, template); err != nil {
+	if err := setupContainerdConfig(ctx, cfg); err != nil {
 		return err
 	}
 
 	if os.Getenv("CONTAINERD_LOG_LEVEL") != "" {
-		args = append(args, "-l", "CONTAINERD_LOG_LEVEL")
+		args = append(args, "-l", os.Getenv("CONTAINERD_LOG_LEVEL"))
 	}
 
 	stdOut := io.Writer(os.Stdout)
@@ -96,13 +76,13 @@ func Run(ctx context.Context, cfg *config.Node) error {
 	}()
 
 	for {
-		addr, dailer, err := util.GetAddressAndDialer("unix://" + cfg.Containerd.Address)
+		addr, dialer, err := util.GetAddressAndDialer("unix://" + cfg.Containerd.Address)
 		if err != nil {
 			time.Sleep(1 * time.Second)
 			continue
 		}
 
-		conn, err := grpc.Dial(addr, grpc.WithInsecure(), grpc.WithTimeout(3*time.Second), grpc.WithDialer(dailer), grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxMsgSize)))
+		conn, err := grpc.Dial(addr, grpc.WithInsecure(), grpc.WithTimeout(3*time.Second), grpc.WithDialer(dialer), grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxMsgSize)))
 		if err != nil {
 			time.Sleep(1 * time.Second)
 			continue
@@ -126,40 +106,99 @@ func Run(ctx context.Context, cfg *config.Node) error {
 		}
 	}
 
+	return preloadImages(cfg)
+}
+
+func preloadImages(cfg *config.Node) error {
 	fileInfo, err := os.Stat(cfg.Images)
-	if err != nil {
-		logrus.Infof("Cannot find images in %s: %v", cfg.Images, err)
-	} else {
-		if fileInfo.IsDir() {
-			fileInfos, err := ioutil.ReadDir(cfg.Images)
-			if err != nil {
-				logrus.Infof("Cannot read images in %s: %v", cfg.Images, err)
-			}
-			client, err := containerd.New(cfg.Containerd.Address)
-			if err != nil {
-				return err
-			}
-			defer client.Close()
-
-			ctxContainerD := namespaces.WithNamespace(context.Background(), "k8s.io")
-
-			for _, fileInfo := range fileInfos {
-				if !fileInfo.IsDir() {
-					filePath := filepath.Join(cfg.Images, fileInfo.Name())
-					file, err := os.Open(filePath)
-					if err != nil {
-						logrus.Errorf("Unable to read %s: %v", filePath, err)
-						continue
-					}
-					logrus.Debugf("Import %s", filePath)
-					_, err = client.Import(ctxContainerD, file)
-					if err != nil {
-						logrus.Errorf("Unable to import %s: %v", filePath, err)
-					}
-				}
-			}
-		}
+	if os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		logrus.Errorf("Unable to find images in %s: %v", cfg.Images, err)
+		return nil
 	}
 
+	if !fileInfo.IsDir() {
+		return nil
+	}
+
+	fileInfos, err := ioutil.ReadDir(cfg.Images)
+	if err != nil {
+		logrus.Errorf("Unable to read images in %s: %v", cfg.Images, err)
+		return nil
+	}
+
+	client, err := containerd.New(cfg.Containerd.Address)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+
+	ctxContainerD := namespaces.WithNamespace(context.Background(), "k8s.io")
+
+	for _, fileInfo := range fileInfos {
+		if fileInfo.IsDir() {
+			continue
+		}
+
+		filePath := filepath.Join(cfg.Images, fileInfo.Name())
+
+		file, err := os.Open(filePath)
+		if err != nil {
+			logrus.Errorf("Unable to read %s: %v", filePath, err)
+			continue
+		}
+
+		logrus.Debugf("Import %s", filePath)
+		_, err = client.Import(ctxContainerD, file)
+		if err != nil {
+			logrus.Errorf("Unable to import %s: %v", filePath, err)
+		}
+	}
 	return nil
+}
+
+func setupContainerdConfig(ctx context.Context, cfg *config.Node) error {
+	privRegistries, err := getPrivateRegistries(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	var containerdTemplate string
+	containerdConfig := templates.ContainerdConfig{
+		NodeConfig:            cfg,
+		IsRunningInUserNS:     system.RunningInUserNS(),
+		PrivateRegistryConfig: privRegistries,
+	}
+
+	containerdTemplateBytes, err := ioutil.ReadFile(cfg.Containerd.Template)
+	if err == nil {
+		logrus.Infof("Using containerd template at %s", cfg.Containerd.Template)
+		containerdTemplate = string(containerdTemplateBytes)
+	} else if os.IsNotExist(err) {
+		containerdTemplate = templates.ContainerdConfigTemplate
+	} else {
+		return err
+	}
+	parsedTemplate, err := templates.ParseTemplateFromConfig(containerdTemplate, containerdConfig)
+	if err != nil {
+		return err
+	}
+
+	return util2.WriteFile(cfg.Containerd.Config, parsedTemplate)
+}
+
+func getPrivateRegistries(ctx context.Context, cfg *config.Node) (*templates.Registry, error) {
+	privRegistries := &templates.Registry{}
+	privRegistryFile, err := ioutil.ReadFile(cfg.AgentConfig.PrivateRegistry)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	logrus.Infof("Using registry config file at %s", cfg.AgentConfig.PrivateRegistry)
+	if err := yaml.Unmarshal(privRegistryFile, &privRegistries); err != nil {
+		return nil, err
+	}
+	return privRegistries, nil
 }

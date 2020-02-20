@@ -23,13 +23,15 @@ import (
 	"strconv"
 	"strings"
 
-	"k8s.io/api/core/v1"
+	"k8s.io/klog"
+	utilexec "k8s.io/utils/exec"
+	"k8s.io/utils/keymutex"
+	"k8s.io/utils/mount"
+	utilstrings "k8s.io/utils/strings"
+
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/klog"
-	"k8s.io/kubernetes/pkg/util/keymutex"
-	"k8s.io/kubernetes/pkg/util/mount"
-	utilstrings "k8s.io/kubernetes/pkg/util/strings"
 	"k8s.io/kubernetes/pkg/volume"
 	ioutil "k8s.io/kubernetes/pkg/volume/util"
 	"k8s.io/kubernetes/pkg/volume/util/volumepathhandler"
@@ -106,7 +108,7 @@ func (plugin *iscsiPlugin) NewMounter(spec *volume.Spec, pod *v1.Pod, _ volume.V
 	return plugin.newMounterInternal(spec, pod.UID, &ISCSIUtil{}, plugin.host.GetMounter(plugin.GetPluginName()), plugin.host.GetExec(plugin.GetPluginName()), secret)
 }
 
-func (plugin *iscsiPlugin) newMounterInternal(spec *volume.Spec, podUID types.UID, manager diskManager, mounter mount.Interface, exec mount.Exec, secret map[string]string) (volume.Mounter, error) {
+func (plugin *iscsiPlugin) newMounterInternal(spec *volume.Spec, podUID types.UID, manager diskManager, mounter mount.Interface, exec utilexec.Interface, secret map[string]string) (volume.Mounter, error) {
 	readOnly, fsType, err := getISCSIVolumeInfo(spec)
 	if err != nil {
 		return nil, err
@@ -149,7 +151,7 @@ func (plugin *iscsiPlugin) NewBlockVolumeMapper(spec *volume.Spec, pod *v1.Pod, 
 	return plugin.newBlockVolumeMapperInternal(spec, uid, &ISCSIUtil{}, plugin.host.GetMounter(plugin.GetPluginName()), plugin.host.GetExec(plugin.GetPluginName()), secret)
 }
 
-func (plugin *iscsiPlugin) newBlockVolumeMapperInternal(spec *volume.Spec, podUID types.UID, manager diskManager, mounter mount.Interface, exec mount.Exec, secret map[string]string) (volume.BlockVolumeMapper, error) {
+func (plugin *iscsiPlugin) newBlockVolumeMapperInternal(spec *volume.Spec, podUID types.UID, manager diskManager, mounter mount.Interface, exec utilexec.Interface, secret map[string]string) (volume.BlockVolumeMapper, error) {
 	readOnly, _, err := getISCSIVolumeInfo(spec)
 	if err != nil {
 		return nil, err
@@ -170,14 +172,14 @@ func (plugin *iscsiPlugin) NewUnmounter(volName string, podUID types.UID) (volum
 	return plugin.newUnmounterInternal(volName, podUID, &ISCSIUtil{}, plugin.host.GetMounter(plugin.GetPluginName()), plugin.host.GetExec(plugin.GetPluginName()))
 }
 
-func (plugin *iscsiPlugin) newUnmounterInternal(volName string, podUID types.UID, manager diskManager, mounter mount.Interface, exec mount.Exec) (volume.Unmounter, error) {
+func (plugin *iscsiPlugin) newUnmounterInternal(volName string, podUID types.UID, manager diskManager, mounter mount.Interface, exec utilexec.Interface) (volume.Unmounter, error) {
 	return &iscsiDiskUnmounter{
 		iscsiDisk: &iscsiDisk{
 			podUID:          podUID,
 			VolName:         volName,
 			manager:         manager,
 			plugin:          plugin,
-			MetricsProvider: volume.NewMetricsStatFS(plugin.host.GetPodVolumeDir(podUID, utilstrings.EscapeQualifiedNameForDisk(iscsiPluginName), volName)),
+			MetricsProvider: volume.NewMetricsStatFS(plugin.host.GetPodVolumeDir(podUID, utilstrings.EscapeQualifiedName(iscsiPluginName), volName)),
 		},
 		mounter:    mounter,
 		exec:       exec,
@@ -190,7 +192,7 @@ func (plugin *iscsiPlugin) NewBlockVolumeUnmapper(volName string, podUID types.U
 	return plugin.newUnmapperInternal(volName, podUID, &ISCSIUtil{}, plugin.host.GetExec(plugin.GetPluginName()))
 }
 
-func (plugin *iscsiPlugin) newUnmapperInternal(volName string, podUID types.UID, manager diskManager, exec mount.Exec) (volume.BlockVolumeUnmapper, error) {
+func (plugin *iscsiPlugin) newUnmapperInternal(volName string, podUID types.UID, manager diskManager, exec utilexec.Interface) (volume.BlockVolumeUnmapper, error) {
 	return &iscsiDiskUnmapper{
 		iscsiDisk: &iscsiDisk{
 			podUID:  podUID,
@@ -231,6 +233,14 @@ func (plugin *iscsiPlugin) ConstructVolumeSpec(volumeName, mountPath string) (*v
 	if err != nil {
 		return nil, err
 	}
+	arr := strings.Split(device, "-lun-")
+	if len(arr) < 2 {
+		return nil, fmt.Errorf("failed to retrieve lun from globalPDPath: %v", globalPDPath)
+	}
+	lun, err := strconv.Atoi(arr[1])
+	if err != nil {
+		return nil, err
+	}
 	iface, _ := extractIface(globalPDPath)
 	iscsiVolume := &v1.Volume{
 		Name: volumeName,
@@ -238,6 +248,7 @@ func (plugin *iscsiPlugin) ConstructVolumeSpec(volumeName, mountPath string) (*v
 			ISCSI: &v1.ISCSIVolumeSource{
 				TargetPortal:   bkpPortal,
 				IQN:            iqn,
+				Lun:            int32(lun),
 				ISCSIInterface: iface,
 			},
 		},
@@ -262,17 +273,18 @@ func (plugin *iscsiPlugin) ConstructBlockVolumeSpec(podUID types.UID, volumeName
 }
 
 type iscsiDisk struct {
-	VolName        string
-	podUID         types.UID
-	Portals        []string
-	Iqn            string
-	Lun            string
-	Iface          string
-	chap_discovery bool
-	chap_session   bool
-	secret         map[string]string
-	InitiatorName  string
-	plugin         *iscsiPlugin
+	VolName       string
+	podUID        types.UID
+	Portals       []string
+	Iqn           string
+	Lun           string
+	InitIface     string
+	Iface         string
+	chapDiscovery bool
+	chapSession   bool
+	secret        map[string]string
+	InitiatorName string
+	plugin        *iscsiPlugin
 	// Utility interface that provides API calls to the provider to attach/detach disks.
 	manager diskManager
 	volume.MetricsProvider
@@ -281,7 +293,7 @@ type iscsiDisk struct {
 func (iscsi *iscsiDisk) GetPath() string {
 	name := iscsiPluginName
 	// safe to use PodVolumeDir now: volume teardown occurs before pod is cleaned up
-	return iscsi.plugin.host.GetPodVolumeDir(iscsi.podUID, utilstrings.EscapeQualifiedNameForDisk(name), iscsi.VolName)
+	return iscsi.plugin.host.GetPodVolumeDir(iscsi.podUID, utilstrings.EscapeQualifiedName(name), iscsi.VolName)
 }
 
 func (iscsi *iscsiDisk) iscsiGlobalMapPath(spec *volume.Spec) (string, error) {
@@ -295,7 +307,7 @@ func (iscsi *iscsiDisk) iscsiGlobalMapPath(spec *volume.Spec) (string, error) {
 
 func (iscsi *iscsiDisk) iscsiPodDeviceMapPath() (string, string) {
 	name := iscsiPluginName
-	return iscsi.plugin.host.GetPodVolumeDeviceDir(iscsi.podUID, utilstrings.EscapeQualifiedNameForDisk(name)), iscsi.VolName
+	return iscsi.plugin.host.GetPodVolumeDeviceDir(iscsi.podUID, utilstrings.EscapeQualifiedName(name)), iscsi.VolName
 }
 
 type iscsiDiskMounter struct {
@@ -304,7 +316,7 @@ type iscsiDiskMounter struct {
 	fsType       string
 	volumeMode   v1.PersistentVolumeMode
 	mounter      *mount.SafeFormatAndMount
-	exec         mount.Exec
+	exec         utilexec.Interface
 	deviceUtil   ioutil.DeviceUtil
 	mountOptions []string
 }
@@ -326,13 +338,13 @@ func (b *iscsiDiskMounter) CanMount() error {
 	return nil
 }
 
-func (b *iscsiDiskMounter) SetUp(fsGroup *int64) error {
-	return b.SetUpAt(b.GetPath(), fsGroup)
+func (b *iscsiDiskMounter) SetUp(mounterArgs volume.MounterArgs) error {
+	return b.SetUpAt(b.GetPath(), mounterArgs)
 }
 
-func (b *iscsiDiskMounter) SetUpAt(dir string, fsGroup *int64) error {
+func (b *iscsiDiskMounter) SetUpAt(dir string, mounterArgs volume.MounterArgs) error {
 	// diskSetUp checks mountpoints and prevent repeated calls
-	err := diskSetUp(b.manager, *b, dir, b.mounter, fsGroup)
+	err := diskSetUp(b.manager, *b, dir, b.mounter, mounterArgs.FsGroup)
 	if err != nil {
 		klog.Errorf("iscsi: failed to setup")
 	}
@@ -342,7 +354,7 @@ func (b *iscsiDiskMounter) SetUpAt(dir string, fsGroup *int64) error {
 type iscsiDiskUnmounter struct {
 	*iscsiDisk
 	mounter    mount.Interface
-	exec       mount.Exec
+	exec       utilexec.Interface
 	deviceUtil ioutil.DeviceUtil
 }
 
@@ -355,34 +367,27 @@ func (c *iscsiDiskUnmounter) TearDown() error {
 }
 
 func (c *iscsiDiskUnmounter) TearDownAt(dir string) error {
-	return ioutil.UnmountPath(dir, c.mounter)
+	return mount.CleanupMountPoint(dir, c.mounter, false)
 }
 
 // Block Volumes Support
 type iscsiDiskMapper struct {
 	*iscsiDisk
 	readOnly   bool
-	exec       mount.Exec
+	exec       utilexec.Interface
 	deviceUtil ioutil.DeviceUtil
 }
 
 var _ volume.BlockVolumeMapper = &iscsiDiskMapper{}
 
-func (b *iscsiDiskMapper) SetUpDevice() (string, error) {
-	return "", nil
-}
-
-func (b *iscsiDiskMapper) MapDevice(devicePath, globalMapPath, volumeMapPath, volumeMapName string, podUID types.UID) error {
-	return ioutil.MapBlockVolume(devicePath, globalMapPath, volumeMapPath, volumeMapName, podUID)
-}
-
 type iscsiDiskUnmapper struct {
 	*iscsiDisk
-	exec       mount.Exec
+	exec       utilexec.Interface
 	deviceUtil ioutil.DeviceUtil
 }
 
 var _ volume.BlockVolumeUnmapper = &iscsiDiskUnmapper{}
+var _ volume.CustomBlockVolumeUnmapper = &iscsiDiskUnmapper{}
 
 // Even though iSCSI plugin has attacher/detacher implementation, iSCSI plugin
 // needs volume detach operation during TearDownDevice(). This method is only
@@ -398,6 +403,10 @@ func (c *iscsiDiskUnmapper) TearDownDevice(mapPath, _ string) error {
 		return fmt.Errorf("iscsi: failed to delete the directory: %s\nError: %v", mapPath, err)
 	}
 	klog.V(4).Infof("iscsi: successfully detached disk: %s", mapPath)
+	return nil
+}
+
+func (c *iscsiDiskUnmapper) UnmapPodDevice() error {
 	return nil
 }
 
@@ -538,19 +547,25 @@ func createISCSIDisk(spec *volume.Spec, podUID types.UID, plugin *iscsiPlugin, m
 		return nil, err
 	}
 
+	initIface := iface
+	if initiatorName != "" {
+		iface = bkportal[0] + ":" + spec.Name()
+	}
+
 	return &iscsiDisk{
-		podUID:         podUID,
-		VolName:        spec.Name(),
-		Portals:        bkportal,
-		Iqn:            iqn,
-		Lun:            lun,
-		Iface:          iface,
-		chap_discovery: chapDiscovery,
-		chap_session:   chapSession,
-		secret:         secret,
-		InitiatorName:  initiatorName,
-		manager:        manager,
-		plugin:         plugin}, nil
+		podUID:        podUID,
+		VolName:       spec.Name(),
+		Portals:       bkportal,
+		Iqn:           iqn,
+		Lun:           lun,
+		InitIface:     initIface,
+		Iface:         iface,
+		chapDiscovery: chapDiscovery,
+		chapSession:   chapSession,
+		secret:        secret,
+		InitiatorName: initiatorName,
+		manager:       manager,
+		plugin:        plugin}, nil
 }
 
 func createSecretMap(spec *volume.Spec, plugin *iscsiPlugin, namespace string) (map[string]string, error) {
@@ -588,15 +603,6 @@ func createSecretMap(spec *volume.Spec, plugin *iscsiPlugin, namespace string) (
 		}
 	}
 	return secret, err
-}
-
-func createVolumeFromISCSIVolumeSource(volumeName string, iscsi v1.ISCSIVolumeSource) *v1.Volume {
-	return &v1.Volume{
-		Name: volumeName,
-		VolumeSource: v1.VolumeSource{
-			ISCSI: &iscsi,
-		},
-	}
 }
 
 func createPersistentVolumeFromISCSIPVSource(volumeName string, iscsi v1.ISCSIPersistentVolumeSource) *v1.PersistentVolume {

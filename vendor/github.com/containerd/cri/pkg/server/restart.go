@@ -26,14 +26,15 @@ import (
 	containerdio "github.com/containerd/containerd/cio"
 	"github.com/containerd/containerd/errdefs"
 	containerdimages "github.com/containerd/containerd/images"
+	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/platforms"
 	"github.com/containerd/typeurl"
 	"github.com/docker/docker/pkg/system"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
-	runtime "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
+	runtime "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 
+	ctrdutil "github.com/containerd/cri/pkg/containerd/util"
 	"github.com/containerd/cri/pkg/netns"
 	cio "github.com/containerd/cri/pkg/server/io"
 	containerstore "github.com/containerd/cri/pkg/store/container"
@@ -57,12 +58,12 @@ func (c *criService) recover(ctx context.Context) error {
 		return errors.Wrap(err, "failed to list sandbox containers")
 	}
 	for _, sandbox := range sandboxes {
-		sb, err := loadSandbox(ctx, sandbox)
+		sb, err := c.loadSandbox(ctx, sandbox)
 		if err != nil {
-			logrus.WithError(err).Errorf("Failed to load sandbox %q", sandbox.ID())
+			log.G(ctx).WithError(err).Errorf("Failed to load sandbox %q", sandbox.ID())
 			continue
 		}
-		logrus.Debugf("Loaded sandbox %+v", sb)
+		log.G(ctx).Debugf("Loaded sandbox %+v", sb)
 		if err := c.sandboxStore.Add(sb); err != nil {
 			return errors.Wrapf(err, "failed to add sandbox %q to store", sandbox.ID())
 		}
@@ -79,10 +80,10 @@ func (c *criService) recover(ctx context.Context) error {
 	for _, container := range containers {
 		cntr, err := c.loadContainer(ctx, container)
 		if err != nil {
-			logrus.WithError(err).Errorf("Failed to load container %q", container.ID())
+			log.G(ctx).WithError(err).Errorf("Failed to load container %q", container.ID())
 			continue
 		}
-		logrus.Debugf("Loaded container %+v", cntr)
+		log.G(ctx).Debugf("Loaded container %+v", cntr)
 		if err := c.containerStore.Add(cntr); err != nil {
 			return errors.Wrapf(err, "failed to add container %q to store", container.ID())
 		}
@@ -129,7 +130,7 @@ func (c *criService) recover(ctx context.Context) error {
 			errMsg: "failed to cleanup orphaned volatile container directories",
 		},
 	} {
-		if err := cleanupOrphanedIDDirs(cleanup.cntrs, cleanup.base); err != nil {
+		if err := cleanupOrphanedIDDirs(ctx, cleanup.cntrs, cleanup.base); err != nil {
 			return errors.Wrap(err, cleanup.errMsg)
 		}
 	}
@@ -146,7 +147,7 @@ func (c *criService) recover(ctx context.Context) error {
 // * ListContainerStats: Not in critical code path, a default timeout will
 // be applied at CRI level.
 // * Recovery logic: We should set a time for each container/sandbox recovery.
-// * Event montior: We should set a timeout for each container/sandbox event handling.
+// * Event monitor: We should set a timeout for each container/sandbox event handling.
 const loadContainerTimeout = 10 * time.Second
 
 // loadContainer loads container from containerd and status checkpoint.
@@ -175,7 +176,7 @@ func (c *criService) loadContainer(ctx context.Context, cntr containerd.Containe
 	// Load status from checkpoint.
 	status, err := containerstore.LoadStatus(containerDir, id)
 	if err != nil {
-		logrus.WithError(err).Warnf("Failed to load container status for %q", id)
+		log.G(ctx).WithError(err).Warnf("Failed to load container status for %q", id)
 		status = unknownContainerStatus()
 	}
 
@@ -275,6 +276,22 @@ func (c *criService) loadContainer(ctx context.Context, cntr containerd.Containe
 					status.StartedAt = time.Now().UnixNano()
 					status.Pid = t.Pid()
 				}
+				// Wait for the task for exit monitor.
+				// wait is a long running background request, no timeout needed.
+				exitCh, err := t.Wait(ctrdutil.NamespacedContext())
+				if err != nil {
+					if !errdefs.IsNotFound(err) {
+						return errors.Wrap(err, "failed to wait for task")
+					}
+					// Container was in running state, but its task has been deleted,
+					// set unknown exited state.
+					status.FinishedAt = time.Now().UnixNano()
+					status.ExitCode = unknownExitCode
+					status.Reason = unknownExitReason
+				} else {
+					// Start exit monitor.
+					c.eventMonitor.startExitMonitor(context.Background(), id, status.Pid, exitCh)
+				}
 			case containerd.Stopped:
 				// Task is stopped. Updata status and delete the task.
 				if _, err := t.Delete(ctx, containerd.WithProcessKill); err != nil && !errdefs.IsNotFound(err) {
@@ -289,7 +306,7 @@ func (c *criService) loadContainer(ctx context.Context, cntr containerd.Containe
 		return nil
 	}()
 	if err != nil {
-		logrus.WithError(err).Errorf("Failed to load container status for %q", id)
+		log.G(ctx).WithError(err).Errorf("Failed to load container status for %q", id)
 		status = unknownContainerStatus()
 	}
 	opts := []containerstore.Opts{
@@ -304,7 +321,7 @@ func (c *criService) loadContainer(ctx context.Context, cntr containerd.Containe
 }
 
 // loadSandbox loads sandbox from containerd.
-func loadSandbox(ctx context.Context, cntr containerd.Container) (sandboxstore.Sandbox, error) {
+func (c *criService) loadSandbox(ctx context.Context, cntr containerd.Container) (sandboxstore.Sandbox, error) {
 	ctx, cancel := context.WithTimeout(ctx, loadContainerTimeout)
 	defer cancel()
 	var sandbox sandboxstore.Sandbox
@@ -358,9 +375,20 @@ func loadSandbox(ctx context.Context, cntr containerd.Container) (sandboxstore.S
 			status.State = sandboxstore.StateNotReady
 		} else {
 			if taskStatus.Status == containerd.Running {
-				// Task is running, set sandbox state as READY.
-				status.State = sandboxstore.StateReady
-				status.Pid = t.Pid()
+				// Wait for the task for sandbox monitor.
+				// wait is a long running background request, no timeout needed.
+				exitCh, err := t.Wait(ctrdutil.NamespacedContext())
+				if err != nil {
+					if !errdefs.IsNotFound(err) {
+						return status, errors.Wrap(err, "failed to wait for task")
+					}
+					status.State = sandboxstore.StateNotReady
+				} else {
+					// Task is running, set sandbox state as READY.
+					status.State = sandboxstore.StateReady
+					status.Pid = t.Pid()
+					c.eventMonitor.startExitMonitor(context.Background(), meta.ID, status.Pid, exitCh)
+				}
 			} else {
 				// Task is not running. Delete the task and set sandbox state as NOTREADY.
 				if _, err := t.Delete(ctx, containerd.WithProcessKill); err != nil && !errdefs.IsNotFound(err) {
@@ -372,7 +400,7 @@ func loadSandbox(ctx context.Context, cntr containerd.Container) (sandboxstore.S
 		return status, nil
 	}()
 	if err != nil {
-		logrus.WithError(err).Errorf("Failed to load sandbox status for %q", cntr.ID())
+		log.G(ctx).WithError(err).Errorf("Failed to load sandbox status for %q", cntr.ID())
 	}
 
 	sandbox = sandboxstore.NewSandbox(*meta, s)
@@ -397,32 +425,32 @@ func (c *criService) loadImages(ctx context.Context, cImages []containerd.Image)
 	for _, i := range cImages {
 		ok, _, _, _, err := containerdimages.Check(ctx, i.ContentStore(), i.Target(), platforms.Default())
 		if err != nil {
-			logrus.WithError(err).Errorf("Failed to check image content readiness for %q", i.Name())
+			log.G(ctx).WithError(err).Errorf("Failed to check image content readiness for %q", i.Name())
 			continue
 		}
 		if !ok {
-			logrus.Warnf("The image content readiness for %q is not ok", i.Name())
+			log.G(ctx).Warnf("The image content readiness for %q is not ok", i.Name())
 			continue
 		}
 		// Checking existence of top-level snapshot for each image being recovered.
 		unpacked, err := i.IsUnpacked(ctx, snapshotter)
 		if err != nil {
-			logrus.WithError(err).Warnf("Failed to check whether image is unpacked for image %s", i.Name())
+			log.G(ctx).WithError(err).Warnf("Failed to check whether image is unpacked for image %s", i.Name())
 			continue
 		}
 		if !unpacked {
-			logrus.Warnf("The image %s is not unpacked.", i.Name())
+			log.G(ctx).Warnf("The image %s is not unpacked.", i.Name())
 			// TODO(random-liu): Consider whether we should try unpack here.
 		}
 		if err := c.updateImage(ctx, i.Name()); err != nil {
-			logrus.WithError(err).Warnf("Failed to update reference for image %q", i.Name())
+			log.G(ctx).WithError(err).Warnf("Failed to update reference for image %q", i.Name())
 			continue
 		}
-		logrus.Debugf("Loaded image %q", i.Name())
+		log.G(ctx).Debugf("Loaded image %q", i.Name())
 	}
 }
 
-func cleanupOrphanedIDDirs(cntrs []containerd.Container, base string) error {
+func cleanupOrphanedIDDirs(ctx context.Context, cntrs []containerd.Container, base string) error {
 	// Cleanup orphaned id directories.
 	dirs, err := ioutil.ReadDir(base)
 	if err != nil && !os.IsNotExist(err) {
@@ -434,7 +462,7 @@ func cleanupOrphanedIDDirs(cntrs []containerd.Container, base string) error {
 	}
 	for _, d := range dirs {
 		if !d.IsDir() {
-			logrus.Warnf("Invalid file %q found in base directory %q", d.Name(), base)
+			log.G(ctx).Warnf("Invalid file %q found in base directory %q", d.Name(), base)
 			continue
 		}
 		if _, ok := idsMap[d.Name()]; ok {
@@ -443,9 +471,9 @@ func cleanupOrphanedIDDirs(cntrs []containerd.Container, base string) error {
 		}
 		dir := filepath.Join(base, d.Name())
 		if err := system.EnsureRemoveAll(dir); err != nil {
-			logrus.WithError(err).Warnf("Failed to remove id directory %q", dir)
+			log.G(ctx).WithError(err).Warnf("Failed to remove id directory %q", dir)
 		} else {
-			logrus.Debugf("Cleanup orphaned id directory %q", dir)
+			log.G(ctx).Debugf("Cleanup orphaned id directory %q", dir)
 		}
 	}
 	return nil

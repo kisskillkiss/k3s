@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"syscall"
 
-	"github.com/Microsoft/hcsshim/internal/guid"
+	"github.com/Microsoft/go-winio/pkg/guid"
 )
 
 //go:generate go run ../mksyscall_windows.go -output zsyscall_windows.go hcn.go
@@ -132,6 +132,33 @@ func V2SchemaVersion() SchemaVersion {
 		Major: 2,
 		Minor: 0,
 	}
+}
+
+// RemoteSubnetSupported returns an error if the HCN version does not support Remote Subnet policies.
+func RemoteSubnetSupported() error {
+	supported := GetSupportedFeatures()
+	if supported.RemoteSubnet {
+		return nil
+	}
+	return platformDoesNotSupportError("Remote Subnet")
+}
+
+// HostRouteSupported returns an error if the HCN version does not support Host Route policies.
+func HostRouteSupported() error {
+	supported := GetSupportedFeatures()
+	if supported.HostRoute {
+		return nil
+	}
+	return platformDoesNotSupportError("Host Route")
+}
+
+// DSRSupported returns an error if the HCN version does not support Direct Server Return.
+func DSRSupported() error {
+	supported := GetSupportedFeatures()
+	if supported.DSR {
+		return nil
+	}
+	return platformDoesNotSupportError("Direct Server Return (DSR)")
 }
 
 // RequestType are the different operations performed to settings.

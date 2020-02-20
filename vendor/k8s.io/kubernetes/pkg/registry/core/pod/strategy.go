@@ -28,7 +28,6 @@ import (
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	apimachineryvalidation "k8s.io/apimachinery/pkg/apis/meta/v1/validation"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -38,11 +37,13 @@ import (
 	"k8s.io/apiserver/pkg/registry/generic"
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/names"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	podutil "k8s.io/kubernetes/pkg/api/pod"
 	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/apis/core/helper/qos"
 	"k8s.io/kubernetes/pkg/apis/core/validation"
+	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/kubelet/client"
 	proxyutil "k8s.io/kubernetes/pkg/proxy/util"
 )
@@ -70,7 +71,7 @@ func (podStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
 		QOSClass: qos.GetPodQOS(pod),
 	}
 
-	podutil.DropDisabledAlphaFields(&pod.Spec)
+	podutil.DropDisabledPodFields(pod, nil)
 }
 
 // PrepareForUpdate clears fields that are not allowed to be set by end users on update.
@@ -79,14 +80,15 @@ func (podStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object
 	oldPod := old.(*api.Pod)
 	newPod.Status = oldPod.Status
 
-	podutil.DropDisabledAlphaFields(&newPod.Spec)
-	podutil.DropDisabledAlphaFields(&oldPod.Spec)
+	podutil.DropDisabledPodFields(newPod, oldPod)
 }
 
 // Validate validates a new pod.
 func (podStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
 	pod := obj.(*api.Pod)
-	return validation.ValidatePod(pod)
+	allErrs := validation.ValidatePodCreate(pod)
+	allErrs = append(allErrs, validation.ValidateConditionalPod(pod, nil, field.NewPath(""))...)
+	return allErrs
 }
 
 // Canonicalize normalizes the object after validation.
@@ -98,21 +100,12 @@ func (podStrategy) AllowCreateOnUpdate() bool {
 	return false
 }
 
-func isUpdatingUninitializedPod(old runtime.Object) (bool, error) {
-	return false, nil
-}
-
 // ValidateUpdate is the default update validation for an end user.
 func (podStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
 	errorList := validation.ValidatePod(obj.(*api.Pod))
-	uninitializedUpdate, err := isUpdatingUninitializedPod(old)
-	if err != nil {
-		return append(errorList, field.InternalError(field.NewPath("metadata"), err))
-	}
-	if uninitializedUpdate {
-		return errorList
-	}
-	return append(errorList, validation.ValidatePodUpdate(obj.(*api.Pod), old.(*api.Pod))...)
+	errorList = append(errorList, validation.ValidatePodUpdate(obj.(*api.Pod), old.(*api.Pod))...)
+	errorList = append(errorList, validation.ValidateConditionalPod(obj.(*api.Pod), old.(*api.Pod), field.NewPath(""))...)
+	return errorList
 }
 
 // AllowUnconditionalUpdate allows pods to be overwritten
@@ -159,7 +152,7 @@ func (podStrategyWithoutGraceful) CheckGracefulDelete(ctx context.Context, obj r
 	return false
 }
 
-// StrategyWithoutGraceful implements the legacy instant delele behavior.
+// StrategyWithoutGraceful implements the legacy instant delete behavior.
 var StrategyWithoutGraceful = podStrategyWithoutGraceful{Strategy}
 
 type podStatusStrategy struct {
@@ -180,25 +173,26 @@ func (podStatusStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.
 }
 
 func (podStatusStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
-	var errorList field.ErrorList
-	uninitializedUpdate, err := isUpdatingUninitializedPod(old)
-	if err != nil {
-		return append(errorList, field.InternalError(field.NewPath("metadata"), err))
-	}
-	if uninitializedUpdate {
-		return append(errorList, field.Forbidden(field.NewPath("status"), apimachineryvalidation.UninitializedStatusUpdateErrorMsg))
-	}
-	// TODO: merge valid fields after update
 	return validation.ValidatePodStatusUpdate(obj.(*api.Pod), old.(*api.Pod))
 }
 
+type podEphemeralContainersStrategy struct {
+	podStrategy
+}
+
+var EphemeralContainersStrategy = podEphemeralContainersStrategy{Strategy}
+
+func (podEphemeralContainersStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
+	return validation.ValidatePodEphemeralContainersUpdate(obj.(*api.Pod), old.(*api.Pod))
+}
+
 // GetAttrs returns labels and fields of a given object for filtering purposes.
-func GetAttrs(obj runtime.Object) (labels.Set, fields.Set, bool, error) {
+func GetAttrs(obj runtime.Object) (labels.Set, fields.Set, error) {
 	pod, ok := obj.(*api.Pod)
 	if !ok {
-		return nil, nil, false, fmt.Errorf("not a pod")
+		return nil, nil, fmt.Errorf("not a pod")
 	}
-	return labels.Set(pod.ObjectMeta.Labels), PodToSelectableFields(pod), pod.Initializers != nil, nil
+	return labels.Set(pod.ObjectMeta.Labels), PodToSelectableFields(pod), nil
 }
 
 // MatchPod returns a generic matcher for a given label and field selector.
@@ -211,10 +205,9 @@ func MatchPod(label labels.Selector, field fields.Selector) storage.SelectionPre
 	}
 }
 
-func NodeNameTriggerFunc(obj runtime.Object) []storage.MatchValue {
-	pod := obj.(*api.Pod)
-	result := storage.MatchValue{IndexName: "spec.nodeName", Value: pod.Spec.NodeName}
-	return []storage.MatchValue{result}
+// NodeNameTriggerFunc returns value spec.nodename of given object.
+func NodeNameTriggerFunc(obj runtime.Object) string {
+	return obj.(*api.Pod).Spec.NodeName
 }
 
 // PodToSelectableFields returns a field set that represents the object
@@ -230,7 +223,12 @@ func PodToSelectableFields(pod *api.Pod) fields.Set {
 	podSpecificFieldsSet["spec.schedulerName"] = string(pod.Spec.SchedulerName)
 	podSpecificFieldsSet["spec.serviceAccountName"] = string(pod.Spec.ServiceAccountName)
 	podSpecificFieldsSet["status.phase"] = string(pod.Status.Phase)
-	podSpecificFieldsSet["status.podIP"] = string(pod.Status.PodIP)
+	// TODO: add podIPs as a downward API value(s) with proper format
+	podIP := ""
+	if len(pod.Status.PodIPs) > 0 {
+		podIP = string(pod.Status.PodIPs[0].IP)
+	}
+	podSpecificFieldsSet["status.podIP"] = podIP
 	podSpecificFieldsSet["status.nominatedNodeName"] = string(pod.Status.NominatedNodeName)
 	return generic.AddObjectMetaFieldsSet(podSpecificFieldsSet, &pod.ObjectMeta, true)
 }
@@ -252,6 +250,18 @@ func getPod(getter ResourceGetter, ctx context.Context, name string) (*api.Pod, 
 	return pod, nil
 }
 
+// returns primary IP for a Pod
+func getPodIP(pod *api.Pod) string {
+	if pod == nil {
+		return ""
+	}
+	if len(pod.Status.PodIPs) > 0 {
+		return pod.Status.PodIPs[0].IP
+	}
+
+	return ""
+}
+
 // ResourceLocation returns a URL to which one can send traffic for the specified pod.
 func ResourceLocation(getter ResourceGetter, rt http.RoundTripper, ctx context.Context, id string) (*url.URL, http.RoundTripper, error) {
 	// Allow ID as "podname" or "podname:port" or "scheme:podname:port".
@@ -260,7 +270,6 @@ func ResourceLocation(getter ResourceGetter, rt http.RoundTripper, ctx context.C
 	if !valid {
 		return nil, nil, errors.NewBadRequest(fmt.Sprintf("invalid pod request %q", id))
 	}
-	// TODO: if port is not a number but a "(container)/(portname)", do a name lookup.
 
 	pod, err := getPod(getter, ctx, name)
 	if err != nil {
@@ -276,8 +285,8 @@ func ResourceLocation(getter ResourceGetter, rt http.RoundTripper, ctx context.C
 			}
 		}
 	}
-
-	if err := proxyutil.IsProxyableIP(pod.Status.PodIP); err != nil {
+	podIP := getPodIP(pod)
+	if err := proxyutil.IsProxyableIP(podIP); err != nil {
 		return nil, nil, errors.NewBadRequest(err.Error())
 	}
 
@@ -285,9 +294,9 @@ func ResourceLocation(getter ResourceGetter, rt http.RoundTripper, ctx context.C
 		Scheme: scheme,
 	}
 	if port == "" {
-		loc.Host = pod.Status.PodIP
+		loc.Host = podIP
 	} else {
-		loc.Host = net.JoinHostPort(pod.Status.PodIP, port)
+		loc.Host = net.JoinHostPort(podIP, port)
 	}
 	return loc, rt, nil
 }
@@ -375,21 +384,23 @@ func LogLocation(
 		Path:     fmt.Sprintf("/containerLogs/%s/%s/%s", pod.Namespace, pod.Name, container),
 		RawQuery: params.Encode(),
 	}
+
+	if opts.InsecureSkipTLSVerifyBackend && utilfeature.DefaultFeatureGate.Enabled(features.AllowInsecureBackendProxy) {
+		return loc, nodeInfo.InsecureSkipTLSVerifyTransport, nil
+	}
 	return loc, nodeInfo.Transport, nil
 }
 
 func podHasContainerWithName(pod *api.Pod, containerName string) bool {
-	for _, c := range pod.Spec.Containers {
+	var hasContainer bool
+	podutil.VisitContainers(&pod.Spec, func(c *api.Container) bool {
 		if c.Name == containerName {
-			return true
+			hasContainer = true
+			return false
 		}
-	}
-	for _, c := range pod.Spec.InitContainers {
-		if c.Name == containerName {
-			return true
-		}
-	}
-	return false
+		return true
+	})
+	return hasContainer
 }
 
 func streamParams(params url.Values, opts runtime.Object) error {

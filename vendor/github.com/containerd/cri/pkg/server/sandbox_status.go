@@ -21,10 +21,11 @@ import (
 
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/errdefs"
+	cni "github.com/containerd/go-cni"
 	runtimespec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
-	runtime "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
+	runtime "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 
 	sandboxstore "github.com/containerd/cri/pkg/store/sandbox"
 )
@@ -36,11 +37,11 @@ func (c *criService) PodSandboxStatus(ctx context.Context, r *runtime.PodSandbox
 		return nil, errors.Wrap(err, "an error occurred when try to find sandbox")
 	}
 
-	ip, err := c.getIP(sandbox)
+	ip, additionalIPs, err := c.getIPs(sandbox)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to get sandbox ip")
 	}
-	status := toCRISandboxStatus(sandbox.Metadata, sandbox.Status.Get(), ip)
+	status := toCRISandboxStatus(sandbox.Metadata, sandbox.Status.Get(), ip, additionalIPs)
 	if status.GetCreatedAt() == 0 {
 		// CRI doesn't allow CreatedAt == 0.
 		info, err := sandbox.Container.Info(ctx)
@@ -65,38 +66,45 @@ func (c *criService) PodSandboxStatus(ctx context.Context, r *runtime.PodSandbox
 	}, nil
 }
 
-func (c *criService) getIP(sandbox sandboxstore.Sandbox) (string, error) {
+func (c *criService) getIPs(sandbox sandboxstore.Sandbox) (string, []string, error) {
 	config := sandbox.Config
 
 	if config.GetLinux().GetSecurityContext().GetNamespaceOptions().GetNetwork() == runtime.NamespaceMode_NODE {
 		// For sandboxes using the node network we are not
 		// responsible for reporting the IP.
-		return "", nil
+		return "", nil, nil
 	}
 
 	if closed, err := sandbox.NetNS.Closed(); err != nil {
-		return "", errors.Wrap(err, "check network namespace closed")
+		return "", nil, errors.Wrap(err, "check network namespace closed")
 	} else if closed {
-		return "", nil
+		return "", nil, nil
 	}
 
-	return sandbox.IP, nil
+	return sandbox.IP, sandbox.AdditionalIPs, nil
 }
 
 // toCRISandboxStatus converts sandbox metadata into CRI pod sandbox status.
-func toCRISandboxStatus(meta sandboxstore.Metadata, status sandboxstore.Status, ip string) *runtime.PodSandboxStatus {
+func toCRISandboxStatus(meta sandboxstore.Metadata, status sandboxstore.Status, ip string, additionalIPs []string) *runtime.PodSandboxStatus {
 	// Set sandbox state to NOTREADY by default.
 	state := runtime.PodSandboxState_SANDBOX_NOTREADY
 	if status.State == sandboxstore.StateReady {
 		state = runtime.PodSandboxState_SANDBOX_READY
 	}
 	nsOpts := meta.Config.GetLinux().GetSecurityContext().GetNamespaceOptions()
+	var ips []*runtime.PodIP
+	for _, additionalIP := range additionalIPs {
+		ips = append(ips, &runtime.PodIP{Ip: additionalIP})
+	}
 	return &runtime.PodSandboxStatus{
 		Id:        meta.ID,
 		Metadata:  meta.Config.GetMetadata(),
 		State:     state,
 		CreatedAt: status.CreatedAt.UnixNano(),
-		Network:   &runtime.PodSandboxNetworkStatus{Ip: ip},
+		Network: &runtime.PodSandboxNetworkStatus{
+			Ip:            ip,
+			AdditionalIps: ips,
+		},
 		Linux: &runtime.LinuxPodSandboxStatus{
 			Namespaces: &runtime.Namespace{
 				Options: &runtime.NamespaceOption{
@@ -106,25 +114,30 @@ func toCRISandboxStatus(meta sandboxstore.Metadata, status sandboxstore.Status, 
 				},
 			},
 		},
-		Labels:      meta.Config.GetLabels(),
-		Annotations: meta.Config.GetAnnotations(),
+		Labels:         meta.Config.GetLabels(),
+		Annotations:    meta.Config.GetAnnotations(),
+		RuntimeHandler: meta.RuntimeHandler,
 	}
 }
 
 // SandboxInfo is extra information for sandbox.
 // TODO (mikebrow): discuss predefining constants structures for some or all of these field names in CRI
 type SandboxInfo struct {
-	Pid            uint32                    `json:"pid"`
-	Status         string                    `json:"processStatus"`
-	NetNSClosed    bool                      `json:"netNamespaceClosed"`
-	Image          string                    `json:"image"`
-	SnapshotKey    string                    `json:"snapshotKey"`
-	Snapshotter    string                    `json:"snapshotter"`
-	RuntimeHandler string                    `json:"runtimeHandler"`
+	Pid         uint32 `json:"pid"`
+	Status      string `json:"processStatus"`
+	NetNSClosed bool   `json:"netNamespaceClosed"`
+	Image       string `json:"image"`
+	SnapshotKey string `json:"snapshotKey"`
+	Snapshotter string `json:"snapshotter"`
+	// Note: a new field `RuntimeHandler` has been added into the CRI PodSandboxStatus struct, and
+	// should be set. This `RuntimeHandler` field will be deprecated after containerd 1.3 (tracked
+	// in https://github.com/containerd/cri/issues/1064).
+	RuntimeHandler string                    `json:"runtimeHandler"` // see the Note above
 	RuntimeType    string                    `json:"runtimeType"`
 	RuntimeOptions interface{}               `json:"runtimeOptions"`
 	Config         *runtime.PodSandboxConfig `json:"config"`
 	RuntimeSpec    *runtimespec.Spec         `json:"runtimeSpec"`
+	CNIResult      *cni.CNIResult            `json:"cniResult"`
 }
 
 // toCRISandboxInfo converts internal container object information to CRI sandbox status response info map.
@@ -150,6 +163,7 @@ func toCRISandboxInfo(ctx context.Context, sandbox sandboxstore.Sandbox) (map[st
 		RuntimeHandler: sandbox.RuntimeHandler,
 		Status:         string(processStatus),
 		Config:         sandbox.Config,
+		CNIResult:      sandbox.CNIResult,
 	}
 
 	if si.Status == "" {

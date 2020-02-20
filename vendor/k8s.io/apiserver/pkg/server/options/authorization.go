@@ -18,7 +18,6 @@ package options
 
 import (
 	"fmt"
-	"k8s.io/client-go/kubernetes"
 	"time"
 
 	"github.com/spf13/pflag"
@@ -29,6 +28,7 @@ import (
 	"k8s.io/apiserver/pkg/authorization/path"
 	"k8s.io/apiserver/pkg/authorization/union"
 	"k8s.io/apiserver/pkg/server"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 )

@@ -21,6 +21,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/containerd/containerd/errdefs"
@@ -84,7 +85,7 @@ func (s *imageStore) List(ctx context.Context, fs ...string) ([]images.Image, er
 
 	filter, err := filters.ParseAll(fs...)
 	if err != nil {
-		return nil, errors.Wrapf(errdefs.ErrInvalidArgument, err.Error())
+		return nil, errors.Wrap(errdefs.ErrInvalidArgument, err.Error())
 	}
 
 	var m []images.Image
@@ -192,6 +193,14 @@ func (s *imageStore) Update(ctx context.Context, image images.Image, fieldpaths 
 					key := strings.TrimPrefix(path, "labels.")
 					updated.Labels[key] = image.Labels[key]
 					continue
+				} else if strings.HasPrefix(path, "annotations.") {
+					if updated.Target.Annotations == nil {
+						updated.Target.Annotations = map[string]string{}
+					}
+
+					key := strings.TrimPrefix(path, "annotations.")
+					updated.Target.Annotations[key] = image.Target.Annotations[key]
+					continue
 				}
 
 				switch path {
@@ -204,6 +213,8 @@ func (s *imageStore) Update(ctx context.Context, image images.Image, fieldpaths 
 					// make sense to modify the size or digest without touching the
 					// mediatype, as well, for example.
 					updated.Target = image.Target
+				case "annotations":
+					updated.Target.Annotations = image.Target.Annotations
 				default:
 					return errors.Wrapf(errdefs.ErrInvalidArgument, "cannot update %q field on image %q", path, image.Name)
 				}
@@ -239,19 +250,16 @@ func (s *imageStore) Delete(ctx context.Context, name string, opts ...images.Del
 			return errors.Wrapf(errdefs.ErrNotFound, "image %q", name)
 		}
 
-		err = bkt.DeleteBucket([]byte(name))
-		if err == bolt.ErrBucketNotFound {
-			return errors.Wrapf(errdefs.ErrNotFound, "image %q", name)
+		if err = bkt.DeleteBucket([]byte(name)); err != nil {
+			if err == bolt.ErrBucketNotFound {
+				err = errors.Wrapf(errdefs.ErrNotFound, "image %q", name)
+			}
+			return err
 		}
 
-		// A reference to a piece of content has been removed,
-		// mark content store as dirty for triggering garbage
-		// collection
-		s.db.dirtyL.Lock()
-		s.db.dirtyCS = true
-		s.db.dirtyL.Unlock()
+		atomic.AddUint32(&s.db.dirty, 1)
 
-		return err
+		return nil
 	})
 }
 
@@ -298,6 +306,11 @@ func readImage(image *images.Image, bkt *bolt.Bucket) error {
 	}
 	image.Labels = labels
 
+	image.Target.Annotations, err = boltutil.ReadAnnotations(bkt)
+	if err != nil {
+		return err
+	}
+
 	tbkt := bkt.Bucket(bucketKeyTarget)
 	if tbkt == nil {
 		return errors.New("unable to read target bucket")
@@ -329,6 +342,10 @@ func writeImage(bkt *bolt.Bucket, image *images.Image) error {
 
 	if err := boltutil.WriteLabels(bkt, image.Labels); err != nil {
 		return errors.Wrapf(err, "writing labels for image %v", image.Name)
+	}
+
+	if err := boltutil.WriteAnnotations(bkt, image.Target.Annotations); err != nil {
+		return errors.Wrapf(err, "writing Annotations for image %v", image.Name)
 	}
 
 	// write the target bucket

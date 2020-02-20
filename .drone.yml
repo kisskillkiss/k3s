@@ -8,9 +8,14 @@ platform:
 
 steps:
 - name: build
-  image: rancher/dapper:v0.4.1
+  image: rancher/dapper:v0.4.2
+  secrets: [ gcloud_auth ]
+  environment:
+    GCLOUD_AUTH:
+      from_secret: gcloud_auth
   commands:
   - dapper ci
+  - echo "${DRONE_TAG}-amd64" | sed -e 's/+/-/g' >.tags
   volumes:
   - name: docker
     path: /var/run/docker.sock
@@ -43,9 +48,37 @@ steps:
     password:
       from_secret: docker_password
     repo: "rancher/k3s"
-    tag: "${DRONE_TAG}-amd64"
     username:
       from_secret: docker_username
+  when:
+    instance:
+    - drone-publish.rancher.io
+    ref:
+    - refs/head/master
+    - refs/tags/*
+    event:
+    - tag
+
+- name: test
+  image: rancher/dapper:v0.4.2
+  secrets: [ gcloud_auth ]
+  environment:
+    GCLOUD_AUTH:
+      from_secret: gcloud_auth
+  commands:
+  - dapper -f Dockerfile.test.dapper
+  volumes:
+  - name: docker
+    path: /var/run/docker.sock
+
+- name: github_e2e_logs_release
+  image: ibuildthecloud/github-release:v0.0.1
+  settings:
+    api_key:
+      from_secret: github_token
+    prerelease: true
+    files:
+    - "dist/artifacts/e2e-*.log"
   when:
     instance:
     - drone-publish.rancher.io
@@ -70,9 +103,14 @@ platform:
 
 steps:
 - name: build
-  image: rancher/dapper:v0.4.1
+  image: rancher/dapper:v0.4.2
+  secrets: [ gcloud_auth ]
+  environment:
+    GCLOUD_AUTH:
+      from_secret: gcloud_auth
   commands:
   - dapper ci
+  - echo "${DRONE_TAG}-arm64" | sed -e 's/+/-/g' >.tags
   volumes:
   - name: docker
     path: /var/run/docker.sock
@@ -105,7 +143,6 @@ steps:
     password:
       from_secret: docker_password
     repo: "rancher/k3s"
-    tag: "${DRONE_TAG}-arm64"
     username:
       from_secret: docker_username
   when:
@@ -116,6 +153,18 @@ steps:
     - refs/tags/*
     event:
     - tag
+
+- name: test
+  image: rancher/dapper:v0.4.2
+  secrets: [ gcloud_auth ]
+  environment:
+    GCLOUD_AUTH:
+      from_secret: gcloud_auth
+  commands:
+  - dapper -f Dockerfile.test.dapper
+  volumes:
+  - name: docker
+    path: /var/run/docker.sock
 
 volumes:
 - name: docker
@@ -132,9 +181,14 @@ platform:
 
 steps:
 - name: build
-  image: rancher/dapper:v0.4.1
+  image: rancher/dapper:v0.4.2
+  secrets: [ gcloud_auth ]
+  environment:
+    GCLOUD_AUTH:
+      from_secret: gcloud_auth
   commands:
   - dapper ci
+  - echo "${DRONE_TAG}-arm" | sed -e 's/+/-/g' >.tags
   volumes:
   - name: docker
     path: /var/run/docker.sock
@@ -167,7 +221,6 @@ steps:
     password:
       from_secret: docker_password
     repo: "rancher/k3s"
-    tag: "${DRONE_TAG}-arm"
     username:
       from_secret: docker_username
   when:
@@ -178,6 +231,18 @@ steps:
     - refs/tags/*
     event:
     - tag
+
+- name: test
+  image: rancher/dapper:v0.4.2
+  secrets: [ gcloud_auth ]
+  environment:
+    GCLOUD_AUTH:
+      from_secret: gcloud_auth
+  commands:
+  - dapper -f Dockerfile.test.dapper
+  volumes:
+  - name: docker
+    path: /var/run/docker.sock
 
 volumes:
 - name: docker
@@ -194,18 +259,20 @@ platform:
 
 steps:
 - name: manifest
-  image: plugins/manifest:1.0.2
-  settings:
-    username:
+  image: plugins/docker
+  environment:
+    DOCKER_USERNAME:
       from_secret: docker_username
-    password:
+    DOCKER_PASSWORD:
       from_secret: docker_password
-    platforms:
-      - linux/amd64
-      - linux/arm64
-      - linux/arm
-    target: "rancher/k3s:${DRONE_TAG}"
-    template: "rancher/k3s:${DRONE_TAG}-ARCH"
+  settings:
+    dry_run: true
+    dockerfile: Dockerfile.manifest
+    repo: "rancher/k3s-manifest"
+    build_args_from_env:
+    - DOCKER_USERNAME
+    - DOCKER_PASSWORD
+    - DRONE_TAG
   when:
     instance:
     - drone-publish.rancher.io

@@ -9,14 +9,14 @@ load(
 go_test(
     name = "go_default_test",
     srcs = [
-        "backoff_utils_test.go",
+        "error_channel_test.go",
         "utils_test.go",
     ],
     embed = [":go_default_library"],
     deps = [
-        "//pkg/apis/scheduling:go_default_library",
+        "//pkg/scheduler/apis/extender/v1:go_default_library",
         "//staging/src/k8s.io/api/core/v1:go_default_library",
-        "//staging/src/k8s.io/apimachinery/pkg/types:go_default_library",
+        "//staging/src/k8s.io/apimachinery/pkg/apis/meta/v1:go_default_library",
         "//staging/src/k8s.io/apimachinery/pkg/util/diff:go_default_library",
     ],
 )
@@ -24,17 +24,16 @@ go_test(
 go_library(
     name = "go_default_library",
     srcs = [
-        "backoff_utils.go",
         "clock.go",
+        "error_channel.go",
         "utils.go",
     ],
     importpath = "k8s.io/kubernetes/pkg/scheduler/util",
     deps = [
-        "//pkg/apis/scheduling:go_default_library",
-        "//pkg/features:go_default_library",
+        "//pkg/api/v1/pod:go_default_library",
+        "//pkg/scheduler/apis/extender/v1:go_default_library",
         "//staging/src/k8s.io/api/core/v1:go_default_library",
-        "//staging/src/k8s.io/apimachinery/pkg/types:go_default_library",
-        "//staging/src/k8s.io/apiserver/pkg/util/feature:go_default_library",
+        "//staging/src/k8s.io/apimachinery/pkg/apis/meta/v1:go_default_library",
         "//vendor/k8s.io/klog:go_default_library",
     ],
 )

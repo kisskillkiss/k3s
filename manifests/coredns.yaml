@@ -55,20 +55,25 @@ data:
     .:53 {
         errors
         health
-        kubernetes cluster.local in-addr.arpa ip6.arpa {
+        ready
+        kubernetes %{CLUSTER_DOMAIN}% in-addr.arpa ip6.arpa {
           pods insecure
           upstream
           fallthrough in-addr.arpa ip6.arpa
         }
+        hosts /etc/coredns/NodeHosts {
+          reload 1s
+          fallthrough
+        }
         prometheus :9153
-        proxy . 1.1.1.1
+        forward . /etc/resolv.conf
         cache 30
         loop
         reload
         loadbalance
     }
 ---
-apiVersion: extensions/v1beta1
+apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: coredns
@@ -98,7 +103,7 @@ spec:
         beta.kubernetes.io/os: linux
       containers:
       - name: coredns
-        image: coredns/coredns:1.3.0
+        image: coredns/coredns:1.6.3
         imagePullPolicy: IfNotPresent
         resources:
           limits:
@@ -138,6 +143,15 @@ spec:
           timeoutSeconds: 5
           successThreshold: 1
           failureThreshold: 5
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8181
+            scheme: HTTP
+          initialDelaySeconds: 10
+          timeoutSeconds: 5
+          successThreshold: 1
+          failureThreshold: 5
       dnsPolicy: Default
       volumes:
         - name: config-volume
@@ -146,6 +160,8 @@ spec:
             items:
             - key: Corefile
               path: Corefile
+            - key: NodeHosts
+              path: NodeHosts
 ---
 apiVersion: v1
 kind: Service
@@ -162,7 +178,7 @@ metadata:
 spec:
   selector:
     k8s-app: kube-dns
-  clusterIP: 10.43.0.10
+  clusterIP: %{CLUSTER_DNS}%
   ports:
   - name: dns
     port: 53

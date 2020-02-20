@@ -26,7 +26,7 @@ import (
 	"google.golang.org/grpc"
 	"k8s.io/klog"
 
-	pluginapi "k8s.io/kubernetes/pkg/kubelet/apis/deviceplugin/v1beta1"
+	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
 )
 
 // endpoint maps to a single registered device plugin. It is responsible
@@ -54,7 +54,7 @@ type endpointImpl struct {
 	cb    monitorCallback
 }
 
-// newEndpoint creates a new endpoint for the given resourceName.
+// newEndpointImpl creates a new endpoint for the given resourceName.
 // This is to be used during normal device plugin registration.
 func newEndpointImpl(socketPath, resourceName string, callback monitorCallback) (*endpointImpl, error) {
 	client, c, err := dial(socketPath)

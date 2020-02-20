@@ -6,12 +6,13 @@ import (
 	"sort"
 	"strconv"
 
-	appclient "github.com/rancher/k3s/types/apis/apps/v1"
-	coreclient "github.com/rancher/k3s/types/apis/core/v1"
-	"github.com/rancher/norman/condition"
-	"github.com/rancher/norman/pkg/changeset"
-	"github.com/rancher/norman/pkg/objectset"
-	"github.com/rancher/norman/types/slice"
+	appclient "github.com/rancher/wrangler-api/pkg/generated/controllers/apps/v1"
+	coreclient "github.com/rancher/wrangler-api/pkg/generated/controllers/core/v1"
+	"github.com/rancher/wrangler/pkg/apply"
+	"github.com/rancher/wrangler/pkg/condition"
+	"github.com/rancher/wrangler/pkg/objectset"
+	"github.com/rancher/wrangler/pkg/relatedresource"
+	"github.com/rancher/wrangler/pkg/slice"
 	"github.com/sirupsen/logrus"
 	apps "k8s.io/api/apps/v1"
 	core "k8s.io/api/core/v1"
@@ -21,55 +22,73 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
+	v1getter "k8s.io/client-go/kubernetes/typed/apps/v1"
 	coregetter "k8s.io/client-go/kubernetes/typed/core/v1"
 )
 
 const (
-	image        = "rancher/klipper-lb:v0.1.1"
-	svcNameLabel = "svccontroller.k3s.cattle.io/svcname"
-	Ready        = condition.Cond("Ready")
+	image              = "rancher/klipper-lb:v0.1.2"
+	svcNameLabel       = "svccontroller.k3s.cattle.io/svcname"
+	daemonsetNodeLabel = "svccontroller.k3s.cattle.io/enablelb"
+	nodeSelectorLabel  = "svccontroller.k3s.cattle.io/nodeselector"
+	Ready              = condition.Cond("Ready")
 )
 
 var (
 	trueVal = true
 )
 
-func Register(ctx context.Context, kubernetes kubernetes.Interface, enabled bool) error {
-	clients := coreclient.ClientsFrom(ctx)
-	appClients := appclient.ClientsFrom(ctx)
-
+func Register(ctx context.Context,
+	kubernetes kubernetes.Interface,
+	apply apply.Apply,
+	daemonSetController appclient.DaemonSetController,
+	deployments appclient.DeploymentController,
+	nodes coreclient.NodeController,
+	pods coreclient.PodController,
+	services coreclient.ServiceController,
+	endpoints coreclient.EndpointsController,
+	enabled, rootless bool) error {
 	h := &handler{
-		enabled:   enabled,
-		nodeCache: clients.Node.Cache(),
-		podCache:  clients.Pod.Cache(),
-		processor: objectset.NewProcessor("svccontroller").
-			Client(appClients.Deployment),
-		serviceCache: clients.Service.Cache(),
+		rootless:        rootless,
+		enabled:         enabled,
+		nodeCache:       nodes.Cache(),
+		podCache:        pods.Cache(),
+		deploymentCache: deployments.Cache(),
+		processor: apply.WithSetID("svccontroller").
+			WithCacheTypes(daemonSetController),
+		serviceCache: services.Cache(),
 		services:     kubernetes.CoreV1(),
+		daemonsets:   kubernetes.AppsV1(),
+		deployments:  kubernetes.AppsV1(),
 	}
 
-	clients.Service.OnChange(ctx, "svccontroller", h.onChange)
-	changeset.Watch(ctx, "svccontroller-watcher",
+	services.OnChange(ctx, "svccontroller", h.onChangeService)
+	nodes.OnChange(ctx, "svccontroller", h.onChangeNode)
+	relatedresource.Watch(ctx, "svccontroller-watcher",
 		h.onResourceChange,
-		clients.Service,
-		clients.Pod,
-		clients.Endpoints)
+		services,
+		pods,
+		endpoints)
 
 	return nil
 }
 
 type handler struct {
-	enabled      bool
-	nodeCache    coreclient.NodeClientCache
-	podCache     coreclient.PodClientCache
-	processor    *objectset.Processor
-	serviceCache coreclient.ServiceClientCache
-	services     coregetter.ServicesGetter
+	rootless        bool
+	enabled         bool
+	nodeCache       coreclient.NodeCache
+	podCache        coreclient.PodCache
+	deploymentCache appclient.DeploymentCache
+	processor       apply.Apply
+	serviceCache    coreclient.ServiceCache
+	services        coregetter.ServicesGetter
+	daemonsets      v1getter.DaemonSetsGetter
+	deployments     v1getter.DeploymentsGetter
 }
 
-func (h *handler) onResourceChange(name, namespace string, obj runtime.Object) ([]changeset.Key, error) {
+func (h *handler) onResourceChange(name, namespace string, obj runtime.Object) ([]relatedresource.Key, error) {
 	if ep, ok := obj.(*core.Endpoints); ok {
-		return []changeset.Key{
+		return []relatedresource.Key{
 			{
 				Name:      ep.Name,
 				Namespace: ep.Namespace,
@@ -91,7 +110,7 @@ func (h *handler) onResourceChange(name, namespace string, obj runtime.Object) (
 		return nil, nil
 	}
 
-	return []changeset.Key{
+	return []relatedresource.Key{
 		{
 			Name:      serviceName,
 			Namespace: pod.Namespace,
@@ -99,7 +118,11 @@ func (h *handler) onResourceChange(name, namespace string, obj runtime.Object) (
 	}, nil
 }
 
-func (h *handler) onChange(svc *core.Service) (runtime.Object, error) {
+func (h *handler) onChangeService(key string, svc *core.Service) (*core.Service, error) {
+	if svc == nil {
+		return nil, nil
+	}
+
 	if svc.Spec.Type != core.ServiceTypeLoadBalancer || svc.Spec.ClusterIP == "" ||
 		svc.Spec.ClusterIP == "None" {
 		return svc, nil
@@ -114,7 +137,26 @@ func (h *handler) onChange(svc *core.Service) (runtime.Object, error) {
 	return nil, err
 }
 
+func (h *handler) onChangeNode(key string, node *core.Node) (*core.Node, error) {
+	if node == nil {
+		return nil, nil
+	}
+	if _, ok := node.Labels[daemonsetNodeLabel]; !ok {
+		return node, nil
+	}
+
+	if err := h.updateDaemonSets(); err != nil {
+		return node, err
+	}
+
+	return node, nil
+}
+
 func (h *handler) updateService(svc *core.Service) (runtime.Object, error) {
+	if !h.enabled {
+		return svc, nil
+	}
+
 	pods, err := h.podCache.List(svc.Namespace, labels.SelectorFromSet(map[string]string{
 		svcNameLabel: svc.Name,
 	}))
@@ -171,7 +213,7 @@ func (h *handler) podIPs(pods []*core.Pod) ([]string, error) {
 			continue
 		}
 
-		node, err := h.nodeCache.Get("", pod.Spec.NodeName)
+		node, err := h.nodeCache.Get(pod.Spec.NodeName)
 		if errors.IsNotFound(err) {
 			continue
 		} else if err != nil {
@@ -179,8 +221,15 @@ func (h *handler) podIPs(pods []*core.Pod) ([]string, error) {
 		}
 
 		for _, addr := range node.Status.Addresses {
-			if addr.Type == core.NodeInternalIP {
+			if addr.Type == core.NodeExternalIP {
 				ips[addr.Address] = true
+			}
+		}
+		if len(ips) == 0 {
+			for _, addr := range node.Status.Addresses {
+				if addr.Type == core.NodeInternalIP {
+					ips[addr.Address] = true
+				}
 			}
 		}
 	}
@@ -189,47 +238,38 @@ func (h *handler) podIPs(pods []*core.Pod) ([]string, error) {
 	for k := range ips {
 		ipList = append(ipList, k)
 	}
+
+	if len(ipList) > 0 && h.rootless {
+		return []string{"127.0.0.1"}, nil
+	}
+
 	return ipList, nil
 }
 
 func (h *handler) deployPod(svc *core.Service) error {
+	if err := h.deleteOldDeployments(svc); err != nil {
+		return err
+	}
 	objs := objectset.NewObjectSet()
 	if !h.enabled {
-		return h.processor.NewDesiredSet(svc, objs).Apply()
+		return h.processor.WithOwner(svc).Apply(objs)
 	}
 
-	dep, err := h.newDeployment(svc)
+	ds, err := h.newDaemonSet(svc)
 	if err != nil {
 		return err
 	}
-	if dep != nil {
-		objs.Add(dep)
+	if ds != nil {
+		objs.Add(ds)
 	}
-
-	return h.processor.NewDesiredSet(svc, objs).Apply()
+	return h.processor.WithOwner(svc).Apply(objs)
 }
 
-func (h *handler) newDeployment(svc *core.Service) (*apps.Deployment, error) {
+func (h *handler) newDaemonSet(svc *core.Service) (*apps.DaemonSet, error) {
 	name := fmt.Sprintf("svclb-%s", svc.Name)
-	zeroInt := intstr.FromInt(0)
 	oneInt := intstr.FromInt(1)
-	replicas := int32(0)
 
-	nodes, err := h.nodeCache.List("", labels.Everything())
-	if err != nil {
-		return nil, err
-	}
-
-	for _, node := range nodes {
-		if Ready.IsTrue(node) {
-			replicas += 1
-		}
-		if replicas >= 2 {
-			break
-		}
-	}
-
-	dep := &apps.Deployment{
+	ds := &apps.DaemonSet{
 		ObjectMeta: meta.ObjectMeta{
 			Name:      name,
 			Namespace: svc.Namespace,
@@ -242,13 +282,15 @@ func (h *handler) newDeployment(svc *core.Service) (*apps.Deployment, error) {
 					Controller: &trueVal,
 				},
 			},
+			Labels: map[string]string{
+				nodeSelectorLabel: "false",
+			},
 		},
 		TypeMeta: meta.TypeMeta{
-			Kind:       "Deployment",
+			Kind:       "DaemonSet",
 			APIVersion: "apps/v1",
 		},
-		Spec: apps.DeploymentSpec{
-			Replicas: &replicas,
+		Spec: apps.DaemonSetSpec{
 			Selector: &meta.LabelSelector{
 				MatchLabels: map[string]string{
 					"app": name,
@@ -262,21 +304,17 @@ func (h *handler) newDeployment(svc *core.Service) (*apps.Deployment, error) {
 					},
 				},
 			},
-			Strategy: apps.DeploymentStrategy{
-				Type: apps.RollingUpdateDeploymentStrategyType,
-				RollingUpdate: &apps.RollingUpdateDeployment{
-					MaxSurge:       &zeroInt,
+			UpdateStrategy: apps.DaemonSetUpdateStrategy{
+				Type: apps.RollingUpdateDaemonSetStrategyType,
+				RollingUpdate: &apps.RollingUpdateDaemonSet{
 					MaxUnavailable: &oneInt,
 				},
 			},
 		},
 	}
 
-	for i, port := range svc.Spec.Ports {
-		portName := port.Name
-		if portName == "" {
-			portName = fmt.Sprintf("port-%d", i)
-		}
+	for _, port := range svc.Spec.Ports {
+		portName := fmt.Sprintf("lb-port-%d", port.Port)
 		container := core.Container{
 			Name:            portName,
 			Image:           image,
@@ -286,6 +324,7 @@ func (h *handler) newDeployment(svc *core.Service) (*apps.Deployment, error) {
 					Name:          portName,
 					ContainerPort: port.Port,
 					HostPort:      port.Port,
+					Protocol:      port.Protocol,
 				},
 			},
 			Env: []core.EnvVar{
@@ -315,8 +354,55 @@ func (h *handler) newDeployment(svc *core.Service) (*apps.Deployment, error) {
 			},
 		}
 
-		dep.Spec.Template.Spec.Containers = append(dep.Spec.Template.Spec.Containers, container)
+		ds.Spec.Template.Spec.Containers = append(ds.Spec.Template.Spec.Containers, container)
+	}
+	// Add node selector only if label "svccontroller.k3s.cattle.io/enablelb" exists on the nodes
+	selector, err := labels.Parse(daemonsetNodeLabel)
+	if err != nil {
+		return nil, err
+	}
+	nodesWithLabel, err := h.nodeCache.List(selector)
+	if err != nil {
+		return nil, err
+	}
+	if len(nodesWithLabel) > 0 {
+		ds.Spec.Template.Spec.NodeSelector = map[string]string{
+			daemonsetNodeLabel: "true",
+		}
+		ds.Labels[nodeSelectorLabel] = "true"
+	}
+	return ds, nil
+}
+
+func (h *handler) updateDaemonSets() error {
+	daemonsets, err := h.daemonsets.DaemonSets("").List(meta.ListOptions{
+		LabelSelector: nodeSelectorLabel + "=false",
+	})
+	if err != nil {
+		return err
 	}
 
-	return dep, nil
+	for _, ds := range daemonsets.Items {
+		ds.Spec.Template.Spec.NodeSelector = map[string]string{
+			daemonsetNodeLabel: "true",
+		}
+		ds.Labels[nodeSelectorLabel] = "true"
+		if _, err := h.daemonsets.DaemonSets(ds.Namespace).Update(&ds); err != nil {
+			return err
+		}
+
+	}
+
+	return nil
+}
+
+func (h *handler) deleteOldDeployments(svc *core.Service) error {
+	name := fmt.Sprintf("svclb-%s", svc.Name)
+	if _, err := h.deploymentCache.Get(svc.Namespace, name); err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	return h.deployments.Deployments(svc.Namespace).Delete(name, &meta.DeleteOptions{})
 }

@@ -108,7 +108,7 @@ func createStreams(req *http.Request, w http.ResponseWriter, opts *Options, supp
 	if wsstream.IsWebSocketRequest(req) {
 		ctx, ok = createWebSocketStreams(req, w, opts, idleTimeout)
 	} else {
-		ctx, ok = createHttpStreamStreams(req, w, opts, supportedStreamProtocols, idleTimeout, streamCreationTimeout)
+		ctx, ok = createHTTPStreamStreams(req, w, opts, supportedStreamProtocols, idleTimeout, streamCreationTimeout)
 	}
 	if !ok {
 		return nil, false
@@ -122,7 +122,7 @@ func createStreams(req *http.Request, w http.ResponseWriter, opts *Options, supp
 	return ctx, true
 }
 
-func createHttpStreamStreams(req *http.Request, w http.ResponseWriter, opts *Options, supportedStreamProtocols []string, idleTimeout, streamCreationTimeout time.Duration) (*context, bool) {
+func createHTTPStreamStreams(req *http.Request, w http.ResponseWriter, opts *Options, supportedStreamProtocols []string, idleTimeout, streamCreationTimeout time.Duration) (*context, bool) {
 	protocol, err := httpstream.Handshake(req, w, supportedStreamProtocols)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -232,7 +232,7 @@ WaitForStreams:
 				ctx.resizeStream = stream
 				go waitStreamReply(stream.replySent, replyChan, stop)
 			default:
-				runtime.HandleError(fmt.Errorf("Unexpected stream type: %q", streamType))
+				runtime.HandleError(fmt.Errorf("unexpected stream type: %q", streamType))
 			}
 		case <-replyChan:
 			receivedStreams++
@@ -283,7 +283,7 @@ WaitForStreams:
 				ctx.resizeStream = stream
 				go waitStreamReply(stream.replySent, replyChan, stop)
 			default:
-				runtime.HandleError(fmt.Errorf("Unexpected stream type: %q", streamType))
+				runtime.HandleError(fmt.Errorf("unexpected stream type: %q", streamType))
 			}
 		case <-replyChan:
 			receivedStreams++
@@ -331,7 +331,7 @@ WaitForStreams:
 				ctx.stderrStream = stream
 				go waitStreamReply(stream.replySent, replyChan, stop)
 			default:
-				runtime.HandleError(fmt.Errorf("Unexpected stream type: %q", streamType))
+				runtime.HandleError(fmt.Errorf("unexpected stream type: %q", streamType))
 			}
 		case <-replyChan:
 			receivedStreams++
@@ -385,7 +385,7 @@ WaitForStreams:
 				ctx.stderrStream = stream
 				go waitStreamReply(stream.replySent, replyChan, stop)
 			default:
-				runtime.HandleError(fmt.Errorf("Unexpected stream type: %q", streamType))
+				runtime.HandleError(fmt.Errorf("unexpected stream type: %q", streamType))
 			}
 		case <-replyChan:
 			receivedStreams++

@@ -112,7 +112,7 @@ func SetDefaults_KubeletConfiguration(obj *kubeletconfigv1beta1.KubeletConfigura
 		// set to NodeStatusUpdateFrequency if NodeStatusUpdateFrequency is set
 		// explicitly.
 		if obj.NodeStatusUpdateFrequency == zeroDuration {
-			obj.NodeStatusReportFrequency = metav1.Duration{Duration: time.Minute}
+			obj.NodeStatusReportFrequency = metav1.Duration{Duration: 5 * time.Minute}
 		} else {
 			obj.NodeStatusReportFrequency = obj.NodeStatusUpdateFrequency
 		}
@@ -149,6 +149,9 @@ func SetDefaults_KubeletConfiguration(obj *kubeletconfigv1beta1.KubeletConfigura
 		// Keep the same as default NodeStatusUpdateFrequency
 		obj.CPUManagerReconcilePeriod = metav1.Duration{Duration: 10 * time.Second}
 	}
+	if obj.TopologyManagerPolicy == "" {
+		obj.TopologyManagerPolicy = kubeletconfigv1beta1.NoneTopologyManagerPolicy
+	}
 	if obj.RuntimeRequestTimeout == zeroDuration {
 		obj.RuntimeRequestTimeout = metav1.Duration{Duration: 2 * time.Minute}
 	}
@@ -158,7 +161,8 @@ func SetDefaults_KubeletConfiguration(obj *kubeletconfigv1beta1.KubeletConfigura
 	if obj.MaxPods == 0 {
 		obj.MaxPods = 110
 	}
-	if obj.PodPidsLimit == nil {
+	// default nil or negative value to -1 (implies node allocatable pid limit)
+	if obj.PodPidsLimit == nil || *obj.PodPidsLimit < int64(0) {
 		temp := int64(-1)
 		obj.PodPidsLimit = &temp
 	}

@@ -20,11 +20,12 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	timetypes "github.com/docker/docker/api/types/time"
 	"github.com/urfave/cli"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/kubernetes/pkg/kubelet/kuberuntime/logs"
 )
@@ -39,6 +40,10 @@ var logsCommand = cli.Command{
 		cli.BoolFlag{
 			Name:  "follow, f",
 			Usage: "Follow log output",
+		},
+		cli.BoolFlag{
+			Name:  "previous, p",
+			Usage: "Print the logs for the previous instance of the container in a pod if it exists",
 		},
 		cli.Int64Flag{
 			Name:  "tail",
@@ -77,6 +82,7 @@ var logsCommand = cli.Command{
 			return err
 		}
 		timestamp := ctx.Bool("timestamps")
+		previous := ctx.Bool("previous")
 		logOptions := logs.NewLogOptions(&v1.PodLogOptions{
 			Follow:     ctx.Bool("follow"),
 			TailLines:  &tailLines,
@@ -92,9 +98,16 @@ var logsCommand = cli.Command{
 		if logPath == "" {
 			return fmt.Errorf("The container has not set log path")
 		}
+		if previous {
+			containerAttempt := status.GetMetadata().Attempt
+			if containerAttempt == uint32(0) {
+				return fmt.Errorf("Previous terminated container %s not found", status.GetMetadata().Name)
+			}
+			logPath = fmt.Sprintf("%s%s%s", logPath[:strings.LastIndex(logPath, "/")+1], fmt.Sprint(containerAttempt-1),
+				logPath[strings.LastIndex(logPath, "."):])
+		}
 		return logs.ReadLogs(context.Background(), logPath, status.GetId(), logOptions, runtimeService, os.Stdout, os.Stderr)
 	},
-	After: closeConnection,
 }
 
 // parseTimestamp parses timestamp string as golang duration,

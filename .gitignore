@@ -1,10 +1,18 @@
 *.swp
 /.dapper
+/.tags
 /.idea
 /.trash-cache
 /.vagrant
+/.kube
+/.cache
+/.docker
+/.*_history
+/.viminfo
+/.lesshst
 /*.log
 /bin
+/etc
 /build
 /data-dir
 /dist
@@ -19,4 +27,4 @@ __pycache__
 /tests/.pytest_cache/
 /tests/.tox/
 /tests/.vscode
-
+/sonobuoy-output

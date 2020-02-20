@@ -19,8 +19,9 @@ package sandbox
 import (
 	"encoding/json"
 
+	cni "github.com/containerd/go-cni"
 	"github.com/pkg/errors"
-	runtime "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
+	runtime "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 )
 
 // NOTE(random-liu):
@@ -54,8 +55,12 @@ type Metadata struct {
 	NetNSPath string
 	// IP of Pod if it is attached to non host network
 	IP string
+	// AdditionalIPs of the Pod if it is attached to non host network
+	AdditionalIPs []string
 	// RuntimeHandler is the runtime handler name of the pod.
 	RuntimeHandler string
+	// CNIresult resulting configuration for attached network namespace interfaces
+	CNIResult *cni.CNIResult
 }
 
 // MarshalJSON encodes Metadata into bytes in json format.

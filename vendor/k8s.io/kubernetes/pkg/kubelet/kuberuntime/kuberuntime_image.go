@@ -19,17 +19,16 @@ package kuberuntime
 import (
 	"k8s.io/api/core/v1"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 	"k8s.io/klog"
-	"k8s.io/kubernetes/pkg/credentialprovider"
 	credentialprovidersecrets "k8s.io/kubernetes/pkg/credentialprovider/secrets"
-	runtimeapi "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	"k8s.io/kubernetes/pkg/util/parsers"
 )
 
 // PullImage pulls an image from the network to local storage using the supplied
 // secrets if necessary.
-func (m *kubeGenericRuntimeManager) PullImage(image kubecontainer.ImageSpec, pullSecrets []v1.Secret) (string, error) {
+func (m *kubeGenericRuntimeManager) PullImage(image kubecontainer.ImageSpec, pullSecrets []v1.Secret, podSandboxConfig *runtimeapi.PodSandboxConfig) (string, error) {
 	img := image.Image
 	repoToPull, _, _, err := parsers.ParseImageName(img)
 	if err != nil {
@@ -46,7 +45,7 @@ func (m *kubeGenericRuntimeManager) PullImage(image kubecontainer.ImageSpec, pul
 	if !withCredentials {
 		klog.V(3).Infof("Pulling image %q without credentials", img)
 
-		imageRef, err := m.imageService.PullImage(imgSpec, nil)
+		imageRef, err := m.imageService.PullImage(imgSpec, nil, podSandboxConfig)
 		if err != nil {
 			klog.Errorf("Pull image %q failed: %v", img, err)
 			return "", err
@@ -57,17 +56,16 @@ func (m *kubeGenericRuntimeManager) PullImage(image kubecontainer.ImageSpec, pul
 
 	var pullErrs []error
 	for _, currentCreds := range creds {
-		authConfig := credentialprovider.LazyProvide(currentCreds)
 		auth := &runtimeapi.AuthConfig{
-			Username:      authConfig.Username,
-			Password:      authConfig.Password,
-			Auth:          authConfig.Auth,
-			ServerAddress: authConfig.ServerAddress,
-			IdentityToken: authConfig.IdentityToken,
-			RegistryToken: authConfig.RegistryToken,
+			Username:      currentCreds.Username,
+			Password:      currentCreds.Password,
+			Auth:          currentCreds.Auth,
+			ServerAddress: currentCreds.ServerAddress,
+			IdentityToken: currentCreds.IdentityToken,
+			RegistryToken: currentCreds.RegistryToken,
 		}
 
-		imageRef, err := m.imageService.PullImage(imgSpec, auth)
+		imageRef, err := m.imageService.PullImage(imgSpec, auth, podSandboxConfig)
 		// If there was no error, return success
 		if err == nil {
 			return imageRef, nil

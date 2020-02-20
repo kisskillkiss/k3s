@@ -19,16 +19,14 @@ package crictl
 import (
 	"errors"
 	"fmt"
-	"os"
 	"sort"
 	"strings"
-	"text/tabwriter"
 
-	units "github.com/docker/go-units"
+	"github.com/docker/go-units"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 	"golang.org/x/net/context"
-	pb "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
+	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 )
 
 type imageByRef []*pb.Image
@@ -62,9 +60,10 @@ var pullImageCommand = cli.Command{
 			Usage: "Use `AUTH_STRING` for accessing the registry. AUTH_STRING is a base64 encoded 'USERNAME[:PASSWORD]'",
 		},
 		cli.StringFlag{
-			Name:  "pod-config",
-			Value: "",
-			Usage: "Use `pod-config.[json|yaml]` to override the the pull context",
+			Name:      "pod-config",
+			Value:     "",
+			Usage:     "Use `pod-config.[json|yaml]` to override the the pull context",
+			TakesFile: true,
 		},
 	},
 	ArgsUsage: "NAME[:TAG|@DIGEST]",
@@ -74,9 +73,11 @@ var pullImageCommand = cli.Command{
 			return cli.ShowSubcommandHelp(context)
 		}
 
-		if err := getImageClient(context); err != nil {
+		imageClient, conn, err := getImageClient(context)
+		if err != nil {
 			return err
 		}
+		defer closeConnection(context, conn)
 
 		auth, err := getAuth(context.String("creds"), context.String("auth"))
 		if err != nil {
@@ -101,6 +102,7 @@ var pullImageCommand = cli.Command{
 
 var listImageCommand = cli.Command{
 	Name:                   "images",
+	Aliases:                []string{"image", "img"},
 	Usage:                  "List images",
 	ArgsUsage:              "[REPOSITORY[:TAG]]",
 	SkipArgReorder:         true,
@@ -128,9 +130,11 @@ var listImageCommand = cli.Command{
 		},
 	},
 	Action: func(context *cli.Context) error {
-		if err := getImageClient(context); err != nil {
+		imageClient, conn, err := getImageClient(context)
+		if err != nil {
 			return err
 		}
+		defer closeConnection(context, conn)
 
 		r, err := ListImages(imageClient, context.Args().First())
 		if err != nil {
@@ -146,16 +150,16 @@ var listImageCommand = cli.Command{
 		}
 
 		// output in table format by default.
-		w := tabwriter.NewWriter(os.Stdout, 20, 1, 3, ' ', 0)
+		display := newTableDisplay(20, 1, 3, ' ', 0)
 		verbose := context.Bool("verbose")
 		showDigest := context.Bool("digests")
 		quiet := context.Bool("quiet")
 		noTrunc := context.Bool("no-trunc")
 		if !verbose && !quiet {
 			if showDigest {
-				fmt.Fprintln(w, "IMAGE\tTAG\tDIGEST\tIMAGE ID\tSIZE")
+				display.AddRow([]string{columnImage, columnTag, columnDigest, columnImageID, columnSize})
 			} else {
-				fmt.Fprintln(w, "IMAGE\tTAG\tIMAGE ID\tSIZE")
+				display.AddRow([]string{columnImage, columnTag, columnImageID, columnSize})
 			}
 		}
 		for _, image := range r.Images {
@@ -174,9 +178,9 @@ var listImageCommand = cli.Command{
 				}
 				for _, repoTagPair := range repoTagPairs {
 					if showDigest {
-						fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", repoTagPair[0], repoTagPair[1], repoDigest, id, size)
+						display.AddRow([]string{repoTagPair[0], repoTagPair[1], repoDigest, id, size})
 					} else {
-						fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", repoTagPair[0], repoTagPair[1], id, size)
+						display.AddRow([]string{repoTagPair[0], repoTagPair[1], id, size})
 					}
 				}
 				continue
@@ -199,7 +203,7 @@ var listImageCommand = cli.Command{
 			}
 			fmt.Printf("\n")
 		}
-		w.Flush()
+		display.Flush()
 		return nil
 	},
 }
@@ -224,9 +228,12 @@ var imageStatusCommand = cli.Command{
 		if context.NArg() == 0 {
 			return cli.ShowSubcommandHelp(context)
 		}
-		if err := getImageClient(context); err != nil {
+		imageClient, conn, err := getImageClient(context)
+		if err != nil {
 			return err
 		}
+		defer closeConnection(context, conn)
+
 		verbose := !(context.Bool("quiet"))
 		output := context.String("output")
 		if output == "" { // default to json output
@@ -279,36 +286,122 @@ var imageStatusCommand = cli.Command{
 }
 
 var removeImageCommand = cli.Command{
-	Name:      "rmi",
-	Usage:     "Remove one or more images",
-	ArgsUsage: "IMAGE-ID [IMAGE-ID...]",
-	Action: func(context *cli.Context) error {
-		if context.NArg() == 0 {
-			return cli.ShowSubcommandHelp(context)
-		}
-		if err := getImageClient(context); err != nil {
+	Name:                   "rmi",
+	Usage:                  "Remove one or more images",
+	ArgsUsage:              "IMAGE-ID [IMAGE-ID...]",
+	SkipArgReorder:         true,
+	UseShortOptionHandling: true,
+	Flags: []cli.Flag{
+		cli.BoolFlag{
+			Name:  "all, a",
+			Usage: "Remove all images",
+		},
+		cli.BoolFlag{
+			Name:  "prune, p",
+			Usage: "Remove all unused images",
+		},
+	},
+	Action: func(ctx *cli.Context) error {
+		imageClient, conn, err := getImageClient(ctx)
+		if err != nil {
 			return err
 		}
-		for i := 0; i < context.NArg(); i++ {
-			id := context.Args().Get(i)
+		defer closeConnection(ctx, conn)
 
-			var verbose = false
-			status, err := ImageStatus(imageClient, id, verbose)
+		ids := map[string]bool{}
+		for _, id := range ctx.Args() {
+			logrus.Debugf("User specified image to be removed: %v", id)
+			ids[id] = true
+		}
+
+		all := ctx.Bool("all")
+		prune := ctx.Bool("prune")
+
+		// Add all available images to the ID selector
+		if all || prune {
+			r, err := imageClient.ListImages(context.Background(),
+				&pb.ListImagesRequest{})
 			if err != nil {
-				return fmt.Errorf("image status request for %q failed: %v", id, err)
+				return err
+			}
+			for _, img := range r.GetImages() {
+				logrus.Debugf("Adding image to be removed: %v", img.GetId())
+				ids[img.GetId()] = true
+			}
+		}
+
+		// On prune, remove images which are in use from the ID selector
+		if prune {
+			runtimeClient, conn, err := getRuntimeClient(ctx)
+			if err != nil {
+				return err
+			}
+			defer closeConnection(ctx, conn)
+
+			// Container images
+			c, err := runtimeClient.ListContainers(
+				context.Background(), &pb.ListContainersRequest{},
+			)
+			if err != nil {
+				return err
+			}
+			for _, container := range c.GetContainers() {
+				img := container.GetImage().Image
+				imageStatus, err := ImageStatus(imageClient, img, false)
+				if err != nil {
+					logrus.Errorf(
+						"image status request for %q failed: %v",
+						img, err,
+					)
+					continue
+				}
+				id := imageStatus.GetImage().GetId()
+				logrus.Debugf("Excluding in use container image: %v", id)
+				ids[id] = false
+			}
+		}
+
+		if len(ids) == 0 {
+			logrus.Info("No images to remove")
+			return nil
+		}
+
+		errored := false
+		for id, remove := range ids {
+			if !remove {
+				continue
+			}
+			status, err := ImageStatus(imageClient, id, false)
+			if err != nil {
+				logrus.Errorf("image status request for %q failed: %v", id, err)
+				errored = true
+				continue
 			}
 			if status.Image == nil {
-				return fmt.Errorf("no such image %s", id)
+				logrus.Errorf("no such image %s", id)
+				errored = true
+				continue
 			}
 
 			_, err = RemoveImage(imageClient, id)
 			if err != nil {
-				return fmt.Errorf("error of removing image %q: %v", id, err)
+				// We ignore further errors on prune because there might be
+				// races
+				if !prune {
+					logrus.Errorf("error of removing image %q: %v", id, err)
+					errored = true
+				}
+				continue
 			}
 			for _, repoTag := range status.Image.RepoTags {
 				fmt.Printf("Deleted: %s\n", repoTag)
 			}
 		}
+
+		if errored {
+			return fmt.Errorf("unable to remove the image(s)")
+		}
+
 		return nil
 	},
 }
@@ -325,9 +418,12 @@ var imageFsInfoCommand = cli.Command{
 		},
 	},
 	Action: func(context *cli.Context) error {
-		if err := getImageClient(context); err != nil {
+		imageClient, conn, err := getImageClient(context)
+		if err != nil {
 			return err
 		}
+		defer closeConnection(context, conn)
+
 		output := context.String("output")
 		if output == "" { // default to json output
 			output = "json"
@@ -404,8 +500,9 @@ func getAuth(creds string, auth string) (*pb.AuthConfig, error) {
 // Ideally repo tag should always be image:tag.
 // The repoTags is nil when pulling image by repoDigest,Then we will show image name instead.
 func normalizeRepoTagPair(repoTags []string, imageName string) (repoTagPairs [][]string) {
+	const none = "<none>"
 	if len(repoTags) == 0 {
-		repoTagPairs = append(repoTagPairs, []string{imageName, "<none>"})
+		repoTagPairs = append(repoTagPairs, []string{imageName, none})
 		return
 	}
 	for _, repoTag := range repoTags {
@@ -414,7 +511,11 @@ func normalizeRepoTagPair(repoTags []string, imageName string) (repoTagPairs [][
 			repoTagPairs = append(repoTagPairs, []string{"errorRepoTag", "errorRepoTag"})
 			continue
 		}
-		repoTagPairs = append(repoTagPairs, []string{repoTag[:idx], repoTag[idx+1:]})
+		name := repoTag[:idx]
+		if name == none {
+			name = imageName
+		}
+		repoTagPairs = append(repoTagPairs, []string{name, repoTag[idx+1:]})
 	}
 	return
 }
@@ -428,12 +529,6 @@ func normalizeRepoDigest(repoDigests []string) (string, string) {
 		return "errorName", "errorRepoDigest"
 	}
 	return repoDigestPair[0], repoDigestPair[1]
-}
-
-// PullImage sends a PullImageRequest to the server, and parses
-// the returned PullImageResponse.
-func PullImage(client pb.ImageServiceClient, image string, auth *pb.AuthConfig) (resp *pb.PullImageResponse, err error) {
-	return PullImageWithSandbox(client, image, auth, nil)
 }
 
 // PullImageWithSandbox sends a PullImageRequest to the server, and parses

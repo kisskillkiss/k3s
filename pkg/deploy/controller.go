@@ -10,24 +10,23 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
 	errors2 "github.com/pkg/errors"
-
-	v1 "github.com/rancher/k3s/types/apis/k3s.cattle.io/v1"
-	"github.com/rancher/norman"
-	"github.com/rancher/norman/objectclient"
-	"github.com/rancher/norman/pkg/objectset"
-	"github.com/rancher/norman/types"
+	v12 "github.com/rancher/k3s/pkg/apis/k3s.cattle.io/v1"
+	v1 "github.com/rancher/k3s/pkg/generated/controllers/k3s.cattle.io/v1"
+	"github.com/rancher/wrangler/pkg/apply"
+	"github.com/rancher/wrangler/pkg/merr"
+	"github.com/rancher/wrangler/pkg/objectset"
 	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	yamlDecoder "k8s.io/apimachinery/pkg/util/yaml"
-	"k8s.io/client-go/discovery"
-	"k8s.io/client-go/rest"
 )
 
 const (
@@ -35,56 +34,46 @@ const (
 	startKey = "_start_"
 )
 
-func WatchFiles(ctx context.Context, skips []string, bases ...string) error {
-	server := norman.GetServer(ctx)
-	addons := v1.ClientsFrom(ctx).Addon
-
+func WatchFiles(ctx context.Context, apply apply.Apply, addons v1.AddonController, disables map[string]bool, bases ...string) error {
 	w := &watcher{
+		apply:      apply,
 		addonCache: addons.Cache(),
 		addons:     addons,
-		skips:      skips,
 		bases:      bases,
-		restConfig: *server.Runtime.LocalConfig,
-		discovery:  server.K8sClient.Discovery(),
-		clients:    map[schema.GroupVersionKind]*objectclient.ObjectClient{},
+		disables:   disables,
 	}
 
 	addons.Enqueue("", startKey)
-	addons.Interface().AddHandler(ctx, "addon-start", func(key string, _ *v1.Addon) (runtime.Object, error) {
+	addons.OnChange(ctx, "addon-start", func(key string, _ *v12.Addon) (*v12.Addon, error) {
 		if key == startKey {
-			if err := w.listFiles(true); err != nil {
-				return nil, err
-			}
-			w.started = true
-			return nil, nil
+			go w.start(ctx)
 		}
 		return nil, nil
 	})
 
-	w.start(ctx)
 	return nil
 }
 
 type watcher struct {
-	started    bool
-	addonCache v1.AddonClientCache
+	apply      apply.Apply
+	addonCache v1.AddonCache
 	addons     v1.AddonClient
 	bases      []string
-	skips      []string
-	restConfig rest.Config
-	discovery  discovery.DiscoveryInterface
-	clients    map[schema.GroupVersionKind]*objectclient.ObjectClient
+	disables   map[string]bool
 }
 
 func (w *watcher) start(ctx context.Context) {
+	force := true
 	for {
+		if err := w.listFiles(force); err == nil {
+			force = false
+		} else {
+			logrus.Errorf("failed to process config: %v", err)
+		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-time.After(15 * time.Second):
-			if err := w.listFiles(false); err != nil {
-				logrus.Errorf("failed to process config: %v", err)
-			}
 		}
 	}
 }
@@ -97,44 +86,50 @@ func (w *watcher) listFiles(force bool) error {
 		}
 
 	}
-	return types.NewErrors(errs...)
+	return merr.NewErrors(errs...)
 }
 
 func (w *watcher) listFilesIn(base string, force bool) error {
-	if !w.started {
+	files := map[string]os.FileInfo{}
+	if err := filepath.Walk(base, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		files[path] = info
 		return nil
-	}
-
-	files, err := ioutil.ReadDir(base)
-	if os.IsNotExist(err) {
-		return nil
-	} else if err != nil {
+	}); err != nil {
 		return err
 	}
 
 	skips := map[string]bool{}
-	for _, skip := range w.skips {
-		skips[skip] = true
-	}
-	for _, file := range files {
+	keys := make([]string, len(files))
+	keyIndex := 0
+	for path, file := range files {
 		if strings.HasSuffix(file.Name(), ".skip") {
 			skips[strings.TrimSuffix(file.Name(), ".skip")] = true
 		}
-
+		keys[keyIndex] = path
+		keyIndex++
 	}
+	sort.Strings(keys)
 
 	var errs []error
-	for _, file := range files {
-		if strings.HasSuffix(file.Name(), ".skip") || skips[file.Name()] {
+	for _, path := range keys {
+		if shouldDisableService(base, path, w.disables) {
+			if err := w.delete(path); err != nil {
+				errs = append(errs, errors2.Wrapf(err, "failed to delete %s", path))
+			}
 			continue
 		}
-		p := filepath.Join(base, file.Name())
-		if err := w.deploy(p, !force); err != nil {
-			errs = append(errs, errors2.Wrapf(err, "failed to process %s", p))
+		if skipFile(files[path].Name(), skips) {
+			continue
+		}
+		if err := w.deploy(path, !force); err != nil {
+			errs = append(errs, errors2.Wrapf(err, "failed to process %s", path))
 		}
 	}
 
-	return types.NewErrors(errs...)
+	return merr.NewErrors(errs...)
 }
 
 func (w *watcher) deploy(path string, compareChecksum bool) error {
@@ -160,23 +155,13 @@ func (w *watcher) deploy(path string, compareChecksum bool) error {
 		return err
 	}
 
-	clients, err := w.apply(addon, objectSet)
-	if err != nil {
+	if err := w.apply.WithOwner(&addon).Apply(objectSet); err != nil {
 		return err
-	}
-
-	if w.clients == nil {
-		w.clients = map[schema.GroupVersionKind]*objectclient.ObjectClient{}
 	}
 
 	addon.Spec.Source = path
 	addon.Spec.Checksum = checksum
 	addon.Status.GVKs = nil
-
-	for gvk, client := range clients {
-		addon.Status.GVKs = append(addon.Status.GVKs, gvk)
-		w.clients[gvk] = client
-	}
 
 	if addon.UID == "" {
 		_, err := w.addons.Create(&addon)
@@ -187,43 +172,47 @@ func (w *watcher) deploy(path string, compareChecksum bool) error {
 	return err
 }
 
-func (w *watcher) addon(name string) (v1.Addon, error) {
-	addon, err := w.addonCache.Get(ns, name)
-	if errors.IsNotFound(err) {
-		addon = v1.NewAddon(ns, name, v1.Addon{})
-	} else if err != nil {
-		return v1.Addon{}, err
+func (w *watcher) delete(path string) error {
+	name := name(path)
+	addon, err := w.addon(name)
+	if err != nil {
+		return err
 	}
-	return *addon, nil
+
+	// ensure that the addon is completely removed before deleting the objectSet,
+	// so return when err == nil, otherwise pods may get stuck terminating
+	if err := w.addons.Delete(addon.Namespace, addon.Name, &metav1.DeleteOptions{}); err == nil || !errors.IsNotFound(err) {
+		return err
+	}
+
+	content, err := ioutil.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	objectSet, err := objectSet(content)
+	if err != nil {
+		return err
+	}
+	var gvk []schema.GroupVersionKind
+	for k := range objectSet.ObjectsByGVK() {
+		gvk = append(gvk, k)
+	}
+	// apply an empty set with owner & gvk data to delete
+	if err := w.apply.WithOwner(&addon).WithGVK(gvk...).Apply(nil); err != nil {
+		return err
+	}
+
+	return os.Remove(path)
 }
 
-func (w *watcher) apply(addon v1.Addon, set *objectset.ObjectSet) (map[schema.GroupVersionKind]*objectclient.ObjectClient, error) {
-	var (
-		err error
-	)
-
-	op := objectset.NewProcessor(addon.Name)
-	op.AllowDiscovery(w.discovery, w.restConfig)
-
-	ds := op.NewDesiredSet(nil, set)
-
-	for _, gvk := range addon.Status.GVKs {
-		client, ok := w.clients[gvk]
-		if !ok {
-			client, err = objectset.NewDiscoveredClient(gvk, w.restConfig, w.discovery)
-			if err != nil {
-				return nil, err
-			}
-		}
-
-		ds.AddDiscoveredClient(gvk, client)
+func (w *watcher) addon(name string) (v12.Addon, error) {
+	addon, err := w.addonCache.Get(ns, name)
+	if errors.IsNotFound(err) {
+		addon = v12.NewAddon(ns, name, v12.Addon{})
+	} else if err != nil {
+		return v12.Addon{}, err
 	}
-
-	if err := ds.Apply(); err != nil {
-		return nil, err
-	}
-
-	return ds.DiscoveredClients(), nil
+	return *addon, nil
 }
 
 func objectSet(content []byte) (*objectset.ObjectSet, error) {
@@ -247,6 +236,18 @@ func checksum(bytes []byte) string {
 	return hex.EncodeToString(d[:])
 }
 
+func isEmptyYaml(yaml []byte) bool {
+	isEmpty := true
+	lines := bytes.Split(yaml, []byte("\n"))
+	for _, l := range lines {
+		s := bytes.TrimSpace(l)
+		if string(s) != "---" && !bytes.HasPrefix(s, []byte("#")) && string(s) != "" {
+			isEmpty = false
+		}
+	}
+	return isEmpty
+}
+
 func yamlToObjects(in io.Reader) ([]runtime.Object, error) {
 	var result []runtime.Object
 	reader := yamlDecoder.NewYAMLReader(bufio.NewReaderSize(in, 4096))
@@ -259,12 +260,14 @@ func yamlToObjects(in io.Reader) ([]runtime.Object, error) {
 			return nil, err
 		}
 
-		obj, err := toObjects(raw)
-		if err != nil {
-			return nil, err
-		}
+		if !isEmptyYaml(raw) {
+			obj, err := toObjects(raw)
+			if err != nil {
+				return nil, err
+			}
 
-		result = append(result, obj...)
+			result = append(result, obj...)
+		}
 	}
 
 	return result, nil
@@ -275,6 +278,7 @@ func toObjects(bytes []byte) ([]runtime.Object, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	obj, _, err := unstructured.UnstructuredJSONScheme.Decode(bytes, nil, nil)
 	if err != nil {
 		return nil, err
@@ -290,4 +294,46 @@ func toObjects(bytes []byte) ([]runtime.Object, error) {
 	}
 
 	return []runtime.Object{obj}, nil
+}
+
+func skipFile(fileName string, skips map[string]bool) bool {
+	switch {
+	case strings.HasPrefix(fileName, "."):
+		return true
+	case skips[fileName]:
+		return true
+	case strings.HasSuffix(fileName, ".json"):
+		return false
+	case strings.HasSuffix(fileName, ".yml"):
+		return false
+	case strings.HasSuffix(fileName, ".yaml"):
+		return false
+	default:
+		return true
+	}
+}
+
+func shouldDisableService(base, fileName string, disables map[string]bool) bool {
+	relFile := strings.TrimPrefix(fileName, base)
+	namePath := strings.Split(relFile, string(os.PathSeparator))
+	for i := 1; i < len(namePath); i++ {
+		subPath := filepath.Join(namePath[0:i]...)
+		if disables[subPath] {
+			return true
+		}
+	}
+	switch {
+	case strings.HasSuffix(fileName, ".json"):
+	case strings.HasSuffix(fileName, ".yml"):
+	case strings.HasSuffix(fileName, ".yaml"):
+	default:
+		return false
+	}
+	baseFile := filepath.Base(fileName)
+	suffix := filepath.Ext(baseFile)
+	baseName := strings.TrimSuffix(baseFile, suffix)
+	if disables[baseName] {
+		return true
+	}
+	return false
 }

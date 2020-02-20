@@ -19,7 +19,6 @@ package fs
 
 import (
 	"bufio"
-	"bytes"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -30,7 +29,6 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/docker/docker/pkg/mount"
 	"github.com/google/cadvisor/devicemapper"
@@ -43,12 +41,15 @@ import (
 const (
 	LabelSystemRoot   = "root"
 	LabelDockerImages = "docker-images"
-	LabelRktImages    = "rkt-images"
 	LabelCrioImages   = "crio-images"
 )
 
-// The maximum number of `du` and `find` tasks that can be running at once.
-const maxConcurrentOps = 20
+const (
+	// The block size in bytes.
+	statBlockSize uint64 = 512
+	// The maximum number of `disk usage` tasks that can be running at once.
+	maxConcurrentOps = 20
+)
 
 // A pool for restricting the number of consecutive `du` and `find` tasks running.
 var pool = make(chan struct{}, maxConcurrentOps)
@@ -89,23 +90,6 @@ type RealFsInfo struct {
 	fsUUIDToDeviceName map[string]string
 }
 
-type Context struct {
-	// docker root directory.
-	Docker  DockerContext
-	RktPath string
-	Crio    CrioContext
-}
-
-type DockerContext struct {
-	Root         string
-	Driver       string
-	DriverStatus map[string]string
-}
-
-type CrioContext struct {
-	Root string
-}
-
 func NewFsInfo(context Context) (FsInfo, error) {
 	mounts, err := mount.GetMounts(nil)
 	if err != nil {
@@ -133,7 +117,6 @@ func NewFsInfo(context Context) (FsInfo, error) {
 		fsInfo.mounts[mount.Mountpoint] = mount
 	}
 
-	fsInfo.addRktImagesLabel(context, mounts)
 	// need to call this before the log line below printing out the partitions, as this function may
 	// add a "partition" for devicemapper to fsInfo.partitions
 	fsInfo.addDockerImagesLabel(context, mounts)
@@ -182,19 +165,22 @@ func processMounts(mounts []*mount.Info, excludedMountpointPrefixes []string) ma
 
 	supportedFsType := map[string]bool{
 		// all ext systems are checked through prefix.
-		"btrfs": true,
-		"tmpfs": true,
-		"xfs":   true,
-		"zfs":   true,
+		"btrfs":   true,
+		"overlay": true,
+		"tmpfs":   true,
+		"xfs":     true,
+		"zfs":     true,
 	}
 
 	for _, mount := range mounts {
 		if !strings.HasPrefix(mount.Fstype, "ext") && !supportedFsType[mount.Fstype] {
 			continue
 		}
-		// Avoid bind mounts.
+		// Avoid bind mounts, exclude tmpfs.
 		if _, ok := partitions[mount.Source]; ok {
-			continue
+			if mount.Fstype != "tmpfs" {
+				continue
+			}
 		}
 
 		hasPrefix := false
@@ -208,6 +194,10 @@ func processMounts(mounts []*mount.Info, excludedMountpointPrefixes []string) ma
 			continue
 		}
 
+		// using mountpoint to replace device once fstype it tmpfs
+		if mount.Fstype == "tmpfs" {
+			mount.Source = mount.Mountpoint
+		}
 		// btrfs fix: following workaround fixes wrong btrfs Major and Minor Ids reported in /proc/self/mountinfo.
 		// instead of using values from /proc/self/mountinfo we use stat to get Ids from btrfs mount point
 		if mount.Fstype == "btrfs" && mount.Major == 0 && strings.HasPrefix(mount.Source, "/dev/") {
@@ -218,6 +208,11 @@ func processMounts(mounts []*mount.Info, excludedMountpointPrefixes []string) ma
 				mount.Major = major
 				mount.Minor = minor
 			}
+		}
+
+		// overlay fix: Making mount source unique for all overlay mounts, using the mount's major and minor ids.
+		if mount.Fstype == "overlay" {
+			mount.Source = fmt.Sprintf("%s_%d-%d", mount.Source, mount.Major, mount.Minor)
 		}
 
 		partitions[mount.Source] = partition{
@@ -302,20 +297,6 @@ func (self *RealFsInfo) addCrioImagesLabel(context Context, mounts []*mount.Info
 			crioPath = filepath.Dir(crioPath)
 		}
 		self.updateContainerImagesPath(LabelCrioImages, mounts, crioImagePaths)
-	}
-}
-
-func (self *RealFsInfo) addRktImagesLabel(context Context, mounts []*mount.Info) {
-	if context.RktPath != "" {
-		rktPath := context.RktPath
-		rktImagesPaths := map[string]struct{}{
-			"/": {},
-		}
-		for rktPath != "/" && rktPath != "." {
-			rktImagesPaths[rktPath] = struct{}{}
-			rktPath = filepath.Dir(rktPath)
-		}
-		self.updateContainerImagesPath(LabelRktImages, mounts, rktImagesPaths)
 	}
 }
 
@@ -408,8 +389,13 @@ func (self *RealFsInfo) GetFsInfoForPath(mountSet map[string]struct{}) ([]Fs, er
 				klog.V(5).Infof("got devicemapper fs capacity stats: capacity: %v free: %v available: %v:", fs.Capacity, fs.Free, fs.Available)
 				fs.Type = DeviceMapper
 			case ZFS.String():
-				fs.Capacity, fs.Free, fs.Available, err = getZfstats(device)
-				fs.Type = ZFS
+				if _, devzfs := os.Stat("/dev/zfs"); os.IsExist(devzfs) {
+					fs.Capacity, fs.Free, fs.Available, err = getZfstats(device)
+					fs.Type = ZFS
+					break
+				}
+				// if /dev/zfs is not present default to VFS
+				fallthrough
 			default:
 				var inodes, inodesFree uint64
 				if utils.FileExists(partition.mountpoint) {
@@ -559,78 +545,73 @@ func (self *RealFsInfo) GetDirFsDevice(dir string) (*DeviceInfo, error) {
 	return nil, fmt.Errorf("could not find device with major: %d, minor: %d in cached partitions map", major, minor)
 }
 
-func (self *RealFsInfo) GetDirDiskUsage(dir string, timeout time.Duration) (uint64, error) {
+func GetDirUsage(dir string) (UsageInfo, error) {
+	var usage UsageInfo
+
+	if dir == "" {
+		return usage, fmt.Errorf("invalid directory")
+	}
+
+	rootInfo, err := os.Stat(dir)
+	if err != nil {
+		return usage, fmt.Errorf("could not stat %q to get inode usage: %v", dir, err)
+	}
+
+	rootStat, ok := rootInfo.Sys().(*syscall.Stat_t)
+	if !ok {
+		return usage, fmt.Errorf("unsuported fileinfo for getting inode usage of %q", dir)
+	}
+
+	rootDevId := rootStat.Dev
+
+	// dedupedInode stores inodes that could be duplicates (nlink > 1)
+	dedupedInodes := make(map[uint64]struct{})
+
+	err = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if os.IsNotExist(err) {
+			// expected if files appear/vanish
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("unable to count inodes for part of dir %s: %s", dir, err)
+		}
+
+		// according to the docs, Sys can be nil
+		if info.Sys() == nil {
+			return fmt.Errorf("fileinfo Sys is nil")
+		}
+
+		s, ok := info.Sys().(*syscall.Stat_t)
+		if !ok {
+			return fmt.Errorf("unsupported fileinfo; could not convert to stat_t")
+		}
+
+		if s.Dev != rootDevId {
+			// don't descend into directories on other devices
+			return filepath.SkipDir
+		}
+		if s.Nlink > 1 {
+			if _, ok := dedupedInodes[s.Ino]; !ok {
+				// Dedupe things that could be hardlinks
+				dedupedInodes[s.Ino] = struct{}{}
+
+				usage.Bytes += uint64(s.Blocks) * statBlockSize
+				usage.Inodes++
+			}
+		} else {
+			usage.Bytes += uint64(s.Blocks) * statBlockSize
+			usage.Inodes++
+		}
+		return nil
+	})
+
+	return usage, nil
+}
+
+func (self *RealFsInfo) GetDirUsage(dir string) (UsageInfo, error) {
 	claimToken()
 	defer releaseToken()
-	return GetDirDiskUsage(dir, timeout)
-}
-
-func GetDirDiskUsage(dir string, timeout time.Duration) (uint64, error) {
-	if dir == "" {
-		return 0, fmt.Errorf("invalid directory")
-	}
-	cmd := exec.Command("ionice", "-c3", "nice", "-n", "19", "du", "-s", dir)
-	stdoutp, err := cmd.StdoutPipe()
-	if err != nil {
-		return 0, fmt.Errorf("failed to setup stdout for cmd %v - %v", cmd.Args, err)
-	}
-	stderrp, err := cmd.StderrPipe()
-	if err != nil {
-		return 0, fmt.Errorf("failed to setup stderr for cmd %v - %v", cmd.Args, err)
-	}
-
-	if err := cmd.Start(); err != nil {
-		return 0, fmt.Errorf("failed to exec du - %v", err)
-	}
-	timer := time.AfterFunc(timeout, func() {
-		klog.Warningf("Killing cmd %v due to timeout(%s)", cmd.Args, timeout.String())
-		cmd.Process.Kill()
-	})
-	stdoutb, souterr := ioutil.ReadAll(stdoutp)
-	if souterr != nil {
-		klog.Errorf("Failed to read from stdout for cmd %v - %v", cmd.Args, souterr)
-	}
-	stderrb, _ := ioutil.ReadAll(stderrp)
-	err = cmd.Wait()
-	timer.Stop()
-	if err != nil {
-		return 0, fmt.Errorf("du command failed on %s with output stdout: %s, stderr: %s - %v", dir, string(stdoutb), string(stderrb), err)
-	}
-	stdout := string(stdoutb)
-	usageInKb, err := strconv.ParseUint(strings.Fields(stdout)[0], 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("cannot parse 'du' output %s - %s", stdout, err)
-	}
-	return usageInKb * 1024, nil
-}
-
-func (self *RealFsInfo) GetDirInodeUsage(dir string, timeout time.Duration) (uint64, error) {
-	claimToken()
-	defer releaseToken()
-	return GetDirInodeUsage(dir, timeout)
-}
-
-func GetDirInodeUsage(dir string, timeout time.Duration) (uint64, error) {
-	if dir == "" {
-		return 0, fmt.Errorf("invalid directory")
-	}
-	var counter byteCounter
-	var stderr bytes.Buffer
-	findCmd := exec.Command("ionice", "-c3", "nice", "-n", "19", "find", dir, "-xdev", "-printf", ".")
-	findCmd.Stdout, findCmd.Stderr = &counter, &stderr
-	if err := findCmd.Start(); err != nil {
-		return 0, fmt.Errorf("failed to exec cmd %v - %v; stderr: %v", findCmd.Args, err, stderr.String())
-	}
-	timer := time.AfterFunc(timeout, func() {
-		klog.Warningf("Killing cmd %v due to timeout(%s)", findCmd.Args, timeout.String())
-		findCmd.Process.Kill()
-	})
-	err := findCmd.Wait()
-	timer.Stop()
-	if err != nil {
-		return 0, fmt.Errorf("cmd %v failed. stderr: %s; err: %v", findCmd.Args, stderr.String(), err)
-	}
-	return counter.bytesWritten, nil
+	return GetDirUsage(dir)
 }
 
 func getVfsStats(path string) (total uint64, free uint64, avail uint64, inodes uint64, inodesFree uint64, err error) {

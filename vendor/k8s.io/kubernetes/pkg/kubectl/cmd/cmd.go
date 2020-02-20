@@ -28,54 +28,65 @@ import (
 
 	"github.com/spf13/cobra"
 
-	utilflag "k8s.io/apiserver/pkg/util/flag"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/annotate"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/apiresources"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/apply"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/attach"
+	cliflag "k8s.io/component-base/cli/flag"
+	cmdpkg "k8s.io/kubectl/pkg/cmd"
+	"k8s.io/kubectl/pkg/cmd/annotate"
+	"k8s.io/kubectl/pkg/cmd/apiresources"
+	"k8s.io/kubectl/pkg/cmd/apply"
+	"k8s.io/kubectl/pkg/cmd/attach"
+	"k8s.io/kubectl/pkg/cmd/autoscale"
+	"k8s.io/kubectl/pkg/cmd/certificates"
+	"k8s.io/kubectl/pkg/cmd/clusterinfo"
+	"k8s.io/kubectl/pkg/cmd/completion"
+	cmdconfig "k8s.io/kubectl/pkg/cmd/config"
+	"k8s.io/kubectl/pkg/cmd/create"
+	"k8s.io/kubectl/pkg/cmd/delete"
+	"k8s.io/kubectl/pkg/cmd/describe"
+	"k8s.io/kubectl/pkg/cmd/diff"
+	"k8s.io/kubectl/pkg/cmd/drain"
+	"k8s.io/kubectl/pkg/cmd/edit"
+	cmdexec "k8s.io/kubectl/pkg/cmd/exec"
+	"k8s.io/kubectl/pkg/cmd/explain"
+	"k8s.io/kubectl/pkg/cmd/expose"
+	"k8s.io/kubectl/pkg/cmd/get"
+	"k8s.io/kubectl/pkg/cmd/label"
+	"k8s.io/kubectl/pkg/cmd/logs"
+	"k8s.io/kubectl/pkg/cmd/options"
+	"k8s.io/kubectl/pkg/cmd/patch"
+	"k8s.io/kubectl/pkg/cmd/plugin"
+	"k8s.io/kubectl/pkg/cmd/portforward"
+	"k8s.io/kubectl/pkg/cmd/proxy"
+	"k8s.io/kubectl/pkg/cmd/replace"
+	"k8s.io/kubectl/pkg/cmd/rollingupdate"
+	"k8s.io/kubectl/pkg/cmd/rollout"
+	"k8s.io/kubectl/pkg/cmd/run"
+	"k8s.io/kubectl/pkg/cmd/scale"
+	"k8s.io/kubectl/pkg/cmd/set"
+	"k8s.io/kubectl/pkg/cmd/taint"
+	"k8s.io/kubectl/pkg/cmd/top"
+	cmdutil "k8s.io/kubectl/pkg/cmd/util"
+	"k8s.io/kubectl/pkg/cmd/version"
+	"k8s.io/kubectl/pkg/cmd/wait"
+	"k8s.io/kubectl/pkg/util/i18n"
+	"k8s.io/kubectl/pkg/util/templates"
 	"k8s.io/kubernetes/pkg/kubectl/cmd/auth"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/autoscale"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/certificates"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/clusterinfo"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/completion"
-	cmdconfig "k8s.io/kubernetes/pkg/kubectl/cmd/config"
 	"k8s.io/kubernetes/pkg/kubectl/cmd/convert"
 	"k8s.io/kubernetes/pkg/kubectl/cmd/cp"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/create"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/delete"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/describe"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/drain"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/edit"
-	cmdexec "k8s.io/kubernetes/pkg/kubectl/cmd/exec"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/expose"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/get"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/label"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/logs"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/options"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/patch"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/plugin"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/portforward"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/proxy"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/replace"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/rollingupdate"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/rollout"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/run"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/scale"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/set"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/taint"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/top"
-	cmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/version"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/wait"
-	"k8s.io/kubernetes/pkg/kubectl/util/i18n"
-	"k8s.io/kubernetes/pkg/kubectl/util/templates"
 
 	"k8s.io/cli-runtime/pkg/genericclioptions"
+	"k8s.io/kubectl/pkg/cmd/kustomize"
 )
 
 const (
 	bashCompletionFunc = `# call kubectl get $1,
+__kubectl_debug_out()
+{
+    local cmd="$1"
+    __kubectl_debug "${FUNCNAME[1]}: get completion by ${cmd}"
+    eval "${cmd} 2>/dev/null"
+}
+
 __kubectl_override_flag_list=(--kubeconfig --cluster --user --context --namespace --server -n -s)
 __kubectl_override_flags()
 {
@@ -99,7 +110,7 @@ __kubectl_override_flags()
     done
     for var in "${__kubectl_override_flag_list[@]##*-}"; do
         if eval "test -n \"\$${var}\""; then
-            eval "echo \${${var}}"
+            eval "echo -n \${${var}}' '"
         fi
     done
 }
@@ -124,7 +135,7 @@ __kubectl_parse_config()
 {
     local template kubectl_out
     template="{{ range .$1  }}{{ .name }} {{ end }}"
-    if kubectl_out=$(kubectl config $(__kubectl_override_flags) -o template --template="${template}" view 2>/dev/null); then
+    if kubectl_out=$(__kubectl_debug_out "kubectl config $(__kubectl_override_flags) -o template --template=\"${template}\" view"); then
         COMPREPLY=( $( compgen -W "${kubectl_out[*]}" -- "$cur" ) )
     fi
 }
@@ -136,7 +147,7 @@ __kubectl_parse_get()
     local template
     template="${2:-"{{ range .items  }}{{ .metadata.name }} {{ end }}"}"
     local kubectl_out
-    if kubectl_out=$(kubectl get $(__kubectl_override_flags) -o template --template="${template}" "$1" 2>/dev/null); then
+    if kubectl_out=$(__kubectl_debug_out "kubectl get $(__kubectl_override_flags) -o template --template=\"${template}\" \"$1\""); then
         COMPREPLY+=( $( compgen -W "${kubectl_out[*]}" -- "$cur" ) )
     fi
 }
@@ -145,7 +156,7 @@ __kubectl_get_resource()
 {
     if [[ ${#nouns[@]} -eq 0 ]]; then
       local kubectl_out
-      if kubectl_out=$(kubectl api-resources $(__kubectl_override_flags) -o name --cached --request-timeout=5s --verbs=get 2>/dev/null); then
+      if kubectl_out=$(__kubectl_debug_out "kubectl api-resources $(__kubectl_override_flags) -o name --cached --request-timeout=5s --verbs=get"); then
           COMPREPLY=( $( compgen -W "${kubectl_out[*]}" -- "$cur" ) )
           return 0
       fi
@@ -192,7 +203,7 @@ __kubectl_get_containers()
     fi
     local last=${nouns[${len} -1]}
     local kubectl_out
-    if kubectl_out=$(kubectl get $(__kubectl_override_flags) -o template --template="${template}" pods "${last}" 2>/dev/null); then
+    if kubectl_out=$(__kubectl_debug_out "kubectl get $(__kubectl_override_flags) -o template --template=\"${template}\" pods \"${last}\""); then
         COMPREPLY=( $( compgen -W "${kubectl_out[*]}" -- "$cur" ) )
     fi
 }
@@ -225,7 +236,7 @@ __kubectl_cp()
             local template namespace kubectl_out
             template="{{ range .items }}{{ .metadata.namespace }}/{{ .metadata.name }}: {{ end }}"
             namespace="${cur%%/*}"
-            if kubectl_out=( $(kubectl get $(__kubectl_override_flags) --namespace "${namespace}" -o template --template="${template}" pods 2>/dev/null) ); then
+            if kubectl_out=$(__kubectl_debug_out "kubectl get $(__kubectl_override_flags) --namespace \"${namespace}\" -o template --template=\"${template}\" pods"); then
                 COMPREPLY=( $(compgen -W "${kubectl_out[*]}" -- "${cur}") )
             fi
             return
@@ -238,7 +249,7 @@ __kubectl_cp()
     esac
 }
 
-__custom_func() {
+__kubectl_custom_func() {
     case ${last_command} in
         kubectl_get | kubectl_describe | kubectl_delete | kubectl_label | kubectl_edit | kubectl_patch |\
         kubectl_annotate | kubectl_expose | kubectl_scale | kubectl_autoscale | kubectl_taint | kubectl_rollout_* |\
@@ -246,11 +257,11 @@ __custom_func() {
             __kubectl_get_resource
             return
             ;;
-        kubectl_logs | kubectl_attach)
+        kubectl_logs)
             __kubectl_require_pod_and_container
             return
             ;;
-        kubectl_exec | kubectl_port-forward | kubectl_top_pod)
+        kubectl_exec | kubectl_port-forward | kubectl_top_pod | kubectl_attach)
             __kubectl_get_resource_pod
             return
             ;;
@@ -292,7 +303,7 @@ var (
 
 // NewDefaultKubectlCommand creates the `kubectl` command with default arguments
 func NewDefaultKubectlCommand() *cobra.Command {
-	return NewDefaultKubectlCommandWithArgs(&defaultPluginHandler{}, os.Args, os.Stdin, os.Stdout, os.Stderr)
+	return NewDefaultKubectlCommandWithArgs(NewDefaultPluginHandler(plugin.ValidPluginFilenamePrefixes), os.Args, os.Stdin, os.Stdout, os.Stderr)
 }
 
 // NewDefaultKubectlCommandWithArgs creates the `kubectl` command with arguments
@@ -309,7 +320,7 @@ func NewDefaultKubectlCommandWithArgs(pluginHandler PluginHandler, args []string
 		// only look for suitable extension executables if
 		// the specified command does not already exist
 		if _, _, err := cmd.Find(cmdPathPieces); err != nil {
-			if err := handleEndpointExtensions(pluginHandler, cmdPathPieces); err != nil {
+			if err := HandlePluginCommand(pluginHandler, cmdPathPieces); err != nil {
 				fmt.Fprintf(errout, "%v\n", err)
 				os.Exit(1)
 			}
@@ -323,35 +334,68 @@ func NewDefaultKubectlCommandWithArgs(pluginHandler PluginHandler, args []string
 // and performing executable filename lookups to search
 // for valid plugin files, and execute found plugins.
 type PluginHandler interface {
-	// Lookup receives a potential filename and returns
-	// a full or relative path to an executable, if one
-	// exists at the given filename, or an error.
-	Lookup(filename string) (string, error)
+	// exists at the given filename, or a boolean false.
+	// Lookup will iterate over a list of given prefixes
+	// in order to recognize valid plugin filenames.
+	// The first filepath to match a prefix is returned.
+	Lookup(filename string) (string, bool)
 	// Execute receives an executable's filepath, a slice
 	// of arguments, and a slice of environment variables
 	// to relay to the executable.
 	Execute(executablePath string, cmdArgs, environment []string) error
 }
 
-type defaultPluginHandler struct{}
+// DefaultPluginHandler implements PluginHandler
+type DefaultPluginHandler struct {
+	ValidPrefixes []string
+}
+
+// NewDefaultPluginHandler instantiates the DefaultPluginHandler with a list of
+// given filename prefixes used to identify valid plugin filenames.
+func NewDefaultPluginHandler(validPrefixes []string) *DefaultPluginHandler {
+	return &DefaultPluginHandler{
+		ValidPrefixes: validPrefixes,
+	}
+}
 
 // Lookup implements PluginHandler
-func (h *defaultPluginHandler) Lookup(filename string) (string, error) {
-	// if on Windows, append the "exe" extension
-	// to the filename that we are looking up.
-	if runtime.GOOS == "windows" {
-		filename = filename + ".exe"
+func (h *DefaultPluginHandler) Lookup(filename string) (string, bool) {
+	for _, prefix := range h.ValidPrefixes {
+		path, err := exec.LookPath(fmt.Sprintf("%s-%s", prefix, filename))
+		if err != nil || len(path) == 0 {
+			continue
+		}
+		return path, true
 	}
 
-	return exec.LookPath(filename)
+	return "", false
 }
 
 // Execute implements PluginHandler
-func (h *defaultPluginHandler) Execute(executablePath string, cmdArgs, environment []string) error {
-	return syscall.Exec(executablePath, cmdArgs, environment)
+func (h *DefaultPluginHandler) Execute(executablePath string, cmdArgs, environment []string) error {
+
+	// Windows does not support exec syscall.
+	if runtime.GOOS == "windows" {
+		cmd := exec.Command(executablePath, cmdArgs...)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		cmd.Stdin = os.Stdin
+		cmd.Env = environment
+		err := cmd.Run()
+		if err == nil {
+			os.Exit(0)
+		}
+		return err
+	}
+
+	// invoke cmd binary relaying the environment and args given
+	// append executablePath to cmdArgs, as execve will make first argument the "binary name".
+	return syscall.Exec(executablePath, append([]string{executablePath}, cmdArgs...), environment)
 }
 
-func handleEndpointExtensions(pluginHandler PluginHandler, cmdArgs []string) error {
+// HandlePluginCommand receives a pluginHandler and command-line arguments and attempts to find
+// a plugin executable on the PATH that satisfies the given arguments.
+func HandlePluginCommand(pluginHandler PluginHandler, cmdArgs []string) error {
 	remainingArgs := []string{} // all "non-flag" arguments
 
 	for idx := range cmdArgs {
@@ -365,8 +409,8 @@ func handleEndpointExtensions(pluginHandler PluginHandler, cmdArgs []string) err
 
 	// attempt to find binary, starting at longest possible name with given cmdArgs
 	for len(remainingArgs) > 0 {
-		path, err := pluginHandler.Lookup(fmt.Sprintf("kubectl-%s", strings.Join(remainingArgs, "-")))
-		if err != nil || len(path) == 0 {
+		path, found := pluginHandler.Lookup(strings.Join(remainingArgs, "-"))
+		if !found {
 			remainingArgs = remainingArgs[:len(remainingArgs)-1]
 			continue
 		}
@@ -380,9 +424,7 @@ func handleEndpointExtensions(pluginHandler PluginHandler, cmdArgs []string) err
 	}
 
 	// invoke cmd binary relaying the current environment and args given
-	// remainingArgs will always have at least one element.
-	// execve will make remainingArgs[0] the "binary name".
-	if err := pluginHandler.Execute(foundBinaryPath, append([]string{foundBinaryPath}, cmdArgs[len(remainingArgs):]...), os.Environ()); err != nil {
+	if err := pluginHandler.Execute(foundBinaryPath, cmdArgs[len(remainingArgs):], os.Environ()); err != nil {
 		return err
 	}
 
@@ -413,15 +455,15 @@ func NewKubectlCommand(in io.Reader, out, err io.Writer) *cobra.Command {
 	}
 
 	flags := cmds.PersistentFlags()
-	flags.SetNormalizeFunc(utilflag.WarnWordSepNormalizeFunc) // Warn for "_" flags
+	flags.SetNormalizeFunc(cliflag.WarnWordSepNormalizeFunc) // Warn for "_" flags
 
 	// Normalize all flags that are coming from other packages or pre-configurations
 	// a.k.a. change all "_" to "-". e.g. glog package
-	flags.SetNormalizeFunc(utilflag.WordSepNormalizeFunc)
+	flags.SetNormalizeFunc(cliflag.WordSepNormalizeFunc)
 
 	addProfilingFlags(flags)
 
-	kubeConfigFlags := genericclioptions.NewConfigFlags()
+	kubeConfigFlags := genericclioptions.NewConfigFlags(true).WithDeprecatedPasswordFlag()
 	kubeConfigFlags.AddFlags(flags)
 	matchVersionKubeConfigFlags := cmdutil.NewMatchVersionFlags(kubeConfigFlags)
 	matchVersionKubeConfigFlags.AddFlags(cmds.PersistentFlags())
@@ -438,7 +480,7 @@ func NewKubectlCommand(in io.Reader, out, err io.Writer) *cobra.Command {
 	i18n.LoadTranslations("kubectl", nil)
 
 	// From this point and forward we get warnings on flags that contain "_" separators
-	cmds.SetGlobalNormalizationFunc(utilflag.WarnWordSepNormalizeFunc)
+	cmds.SetGlobalNormalizationFunc(cliflag.WarnWordSepNormalizeFunc)
 
 	ioStreams := genericclioptions.IOStreams{In: in, Out: out, ErrOut: err}
 
@@ -455,6 +497,7 @@ func NewKubectlCommand(in io.Reader, out, err io.Writer) *cobra.Command {
 		{
 			Message: "Basic Commands (Intermediate):",
 			Commands: []*cobra.Command{
+				explain.NewCmdExplain("kubectl", f, ioStreams),
 				get.NewCmdGet("kubectl", f, ioStreams),
 				edit.NewCmdEdit(f, ioStreams),
 				delete.NewCmdDelete(f, ioStreams),
@@ -497,11 +540,13 @@ func NewKubectlCommand(in io.Reader, out, err io.Writer) *cobra.Command {
 		{
 			Message: "Advanced Commands:",
 			Commands: []*cobra.Command{
+				diff.NewCmdDiff(f, ioStreams),
 				apply.NewCmdApply("kubectl", f, ioStreams),
 				patch.NewCmdPatch(f, ioStreams),
 				replace.NewCmdReplace(f, ioStreams),
 				wait.NewCmdWait(f, ioStreams),
 				convert.NewCmdConvert(f, ioStreams),
+				kustomize.NewCmdKustomize(ioStreams),
 			},
 		},
 		{
@@ -518,7 +563,7 @@ func NewKubectlCommand(in io.Reader, out, err io.Writer) *cobra.Command {
 	filters := []string{"options"}
 
 	// Hide the "alpha" subcommand if there are no alpha commands in this build.
-	alpha := NewCmdAlpha(f, ioStreams)
+	alpha := cmdpkg.NewCmdAlpha(f, ioStreams)
 	if !alpha.HasSubCommands() {
 		filters = append(filters, alpha.Name())
 	}
@@ -550,19 +595,4 @@ func NewKubectlCommand(in io.Reader, out, err io.Writer) *cobra.Command {
 
 func runHelp(cmd *cobra.Command, args []string) {
 	cmd.Help()
-}
-
-// deprecatedAlias is intended to be used to create a "wrapper" command around
-// an existing command. The wrapper works the same but prints a deprecation
-// message before running. This command is identical functionality.
-func deprecatedAlias(deprecatedVersion string, cmd *cobra.Command) *cobra.Command {
-	// Have to be careful here because Cobra automatically extracts the name
-	// of the command from the .Use field.
-	originalName := cmd.Name()
-
-	cmd.Use = deprecatedVersion
-	cmd.Deprecated = fmt.Sprintf("use %q instead", originalName)
-	cmd.Short = fmt.Sprintf("%s. This command is deprecated, use %q instead", cmd.Short, originalName)
-	cmd.Hidden = true
-	return cmd
 }

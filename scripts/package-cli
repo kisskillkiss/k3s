@@ -1,11 +1,9 @@
 #!/bin/bash
 set -e -x
 
-source $(dirname $0)/version.sh
-
 cd $(dirname $0)/..
 
-./scripts/download
+. ./scripts/version.sh
 
 rm -rf bin/crictl bin/kubectl bin/k3s-agent bin/k3s-server bin/kubectl bin/k3s build/data
 ln -s containerd bin/k3s-agent
@@ -19,12 +17,25 @@ for i in bridge flannel host-local loopback portmap; do
     ln -s cni ./bin/$i
 done
 
+cp contrib/util/check-config.sh bin/check-config
 
 rm -rf build/data
 mkdir -p build/data build/out
 mkdir -p dist/artifacts
 
-tar cvzf ./build/out/data.tar.gz --exclude ./bin/hyperkube ./bin
+(
+    set +x
+    cd bin
+    find . -not -path '*/\.*' -type f -exec sha256sum {} \; | sed -e 's| \./| |' | sort -k2 >.sha256sums
+    (
+        for f in $(find . -type l); do
+            echo $f $(readlink $f)
+        done
+    ) | sed -e 's|^\./||' | sort >.links
+    set -x
+)
+
+tar cvzf ./build/out/data.tar.gz --exclude ./bin/hyperkube ./bin ./etc
 HASH=$(sha256sum ./build/out/data.tar.gz | awk '{print $1}')
 
 cp ./build/out/data.tar.gz ./build/data/${HASH}.tgz
@@ -36,10 +47,18 @@ elif [ ${ARCH} = arm ]; then
     BIN_SUFFIX="-armhf"
 fi
 
-cp -f ./bin/hyperkube dist/artifacts/hyperkube${BIN_SUFFIX}
 CMD_NAME=dist/artifacts/k3s${BIN_SUFFIX}
 
 go generate
-LDFLAGS="-X github.com/rancher/k3s/version.Version=$VERSION -w -s"
+LDFLAGS="
+    -X github.com/rancher/k3s/pkg/version.Version=$VERSION
+    -X github.com/rancher/k3s/pkg/version.GitCommit=${COMMIT:0:8}
+    -w -s
+"
 STATIC="-extldflags '-static'"
-CGO_ENABLED=0 go build -ldflags "$LDFLAGS $STATIC" -o ${CMD_NAME} ./cmd/k3s/main.go
+if [ "$DQLITE" = "true" ]; then
+    DQLITE_TAGS="dqlite"
+fi
+CGO_ENABLED=0 go build -tags "$DQLITE_TAGS" -ldflags "$LDFLAGS $STATIC" -o ${CMD_NAME} ./cmd/k3s/main.go
+
+./scripts/build-upload ${CMD_NAME} ${COMMIT}

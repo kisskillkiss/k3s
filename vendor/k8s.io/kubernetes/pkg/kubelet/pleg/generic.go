@@ -25,8 +25,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/clock"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 	"k8s.io/klog"
-	runtimeapi "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	"k8s.io/kubernetes/pkg/kubelet/metrics"
 )
@@ -189,12 +189,14 @@ func (g *GenericPLEG) relist() {
 	klog.V(5).Infof("GenericPLEG: Relisting")
 
 	if lastRelistTime := g.getRelistTime(); !lastRelistTime.IsZero() {
-		metrics.PLEGRelistInterval.Observe(metrics.SinceInMicroseconds(lastRelistTime))
+		metrics.PLEGRelistInterval.Observe(metrics.SinceInSeconds(lastRelistTime))
+		metrics.DeprecatedPLEGRelistInterval.Observe(metrics.SinceInMicroseconds(lastRelistTime))
 	}
 
 	timestamp := g.clock.Now()
 	defer func() {
-		metrics.PLEGRelistLatency.Observe(metrics.SinceInMicroseconds(timestamp))
+		metrics.PLEGRelistDuration.Observe(metrics.SinceInSeconds(timestamp))
+		metrics.DeprecatedPLEGRelistLatency.Observe(metrics.SinceInMicroseconds(timestamp))
 	}()
 
 	// Get all the pods.
@@ -207,6 +209,8 @@ func (g *GenericPLEG) relist() {
 	g.updateRelistTime(timestamp)
 
 	pods := kubecontainer.Pods(podList)
+	// update running pod and container count
+	updateRunningPodAndContainerMetrics(pods)
 	g.podRecords.setCurrent(pods)
 
 	// Compare the old and the current pods, and generate events.
@@ -244,13 +248,14 @@ func (g *GenericPLEG) relist() {
 			// serially may take a while. We should be aware of this and
 			// parallelize if needed.
 			if err := g.updateCache(pod, pid); err != nil {
-				klog.Errorf("PLEG: Ignoring events for pod %s/%s: %v", pod.Name, pod.Namespace, err)
+				// Rely on updateCache calling GetPodStatus to log the actual error.
+				klog.V(4).Infof("PLEG: Ignoring events for pod %s/%s: %v", pod.Name, pod.Namespace, err)
 
 				// make sure we try to reinspect the pod during the next relisting
 				needsReinspection[pid] = pod
 
 				continue
-			} else if _, found := g.podsToReinspect[pid]; found {
+			} else {
 				// this pod was in the list to reinspect and we did so because it had events, so remove it
 				// from the list (we don't want the reinspection code below to inspect it a second time in
 				// this relist execution)
@@ -264,7 +269,12 @@ func (g *GenericPLEG) relist() {
 			if events[i].Type == ContainerChanged {
 				continue
 			}
-			g.eventChannel <- events[i]
+			select {
+			case g.eventChannel <- events[i]:
+			default:
+				metrics.PLEGDiscardEvents.WithLabelValues().Inc()
+				klog.Error("event channel is full, discard this relist() cycle event")
+			}
 		}
 	}
 
@@ -274,7 +284,8 @@ func (g *GenericPLEG) relist() {
 			klog.V(5).Infof("GenericPLEG: Reinspecting pods that previously failed inspection")
 			for pid, pod := range g.podsToReinspect {
 				if err := g.updateCache(pod, pid); err != nil {
-					klog.Errorf("PLEG: pod %s/%s failed reinspection: %v", pod.Name, pod.Namespace, err)
+					// Rely on updateCache calling GetPodStatus to log the actual error.
+					klog.V(5).Infof("PLEG: pod %s/%s failed reinspection: %v", pod.Name, pod.Namespace, err)
 					needsReinspection[pid] = pod
 				}
 			}
@@ -335,22 +346,22 @@ func (g *GenericPLEG) cacheEnabled() bool {
 	return g.cache != nil
 }
 
-// Preserve an older cached status' pod IP if the new status has no pod IP
+// getPodIP preserves an older cached status' pod IP if the new status has no pod IPs
 // and its sandboxes have exited
-func (g *GenericPLEG) getPodIP(pid types.UID, status *kubecontainer.PodStatus) string {
-	if status.IP != "" {
-		return status.IP
+func (g *GenericPLEG) getPodIPs(pid types.UID, status *kubecontainer.PodStatus) []string {
+	if len(status.IPs) != 0 {
+		return status.IPs
 	}
 
 	oldStatus, err := g.cache.Get(pid)
-	if err != nil || oldStatus.IP == "" {
-		return ""
+	if err != nil || len(oldStatus.IPs) == 0 {
+		return nil
 	}
 
 	for _, sandboxStatus := range status.SandboxStatuses {
 		// If at least one sandbox is ready, then use this status update's pod IP
 		if sandboxStatus.State == runtimeapi.PodSandboxState_SANDBOX_READY {
-			return status.IP
+			return status.IPs
 		}
 	}
 
@@ -360,14 +371,14 @@ func (g *GenericPLEG) getPodIP(pid types.UID, status *kubecontainer.PodStatus) s
 		// running then use the new pod IP
 		for _, containerStatus := range status.ContainerStatuses {
 			if containerStatus.State == kubecontainer.ContainerStateCreated || containerStatus.State == kubecontainer.ContainerStateRunning {
-				return status.IP
+				return status.IPs
 			}
 		}
 	}
 
 	// For pods with no ready containers or sandboxes (like exited pods)
 	// use the old status' pod IP
-	return oldStatus.IP
+	return oldStatus.IPs
 }
 
 func (g *GenericPLEG) updateCache(pod *kubecontainer.Pod, pid types.UID) error {
@@ -389,7 +400,7 @@ func (g *GenericPLEG) updateCache(pod *kubecontainer.Pod, pid types.UID) error {
 		// When a pod is torn down, kubelet may race with PLEG and retrieve
 		// a pod status after network teardown, but the kubernetes API expects
 		// the completed pod's IP to be available after the pod is dead.
-		status.IP = g.getPodIP(pid, status)
+		status.IPs = g.getPodIPs(pid, status)
 	}
 
 	g.cache.Set(pod.ID, status, err, timestamp)
@@ -420,6 +431,24 @@ func getContainerState(pod *kubecontainer.Pod, cid *kubecontainer.ContainerID) p
 	}
 
 	return state
+}
+
+func updateRunningPodAndContainerMetrics(pods []*kubecontainer.Pod) {
+	// Set the number of running pods in the parameter
+	metrics.RunningPodCount.Set(float64(len(pods)))
+	// intermediate map to store the count of each "container_state"
+	containerStateCount := make(map[string]int)
+
+	for _, pod := range pods {
+		containers := pod.Containers
+		for _, container := range containers {
+			// update the corresponding "container_state" in map to set value for the gaugeVec metrics
+			containerStateCount[string(container.State)]++
+		}
+	}
+	for key, value := range containerStateCount {
+		metrics.RunningContainerCount.WithLabelValues(key).Set(float64(value))
+	}
 }
 
 func (pr podRecords) getOld(id types.UID) *kubecontainer.Pod {

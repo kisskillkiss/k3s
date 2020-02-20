@@ -33,7 +33,7 @@ import (
 	"k8s.io/klog"
 )
 
-func handleHttpStreams(req *http.Request, w http.ResponseWriter, portForwarder PortForwarder, podName string, uid types.UID, supportedPortForwardProtocols []string, idleTimeout, streamCreationTimeout time.Duration) error {
+func handleHTTPStreams(req *http.Request, w http.ResponseWriter, portForwarder PortForwarder, podName string, uid types.UID, supportedPortForwardProtocols []string, idleTimeout, streamCreationTimeout time.Duration) error {
 	_, err := httpstream.Handshake(req, w, supportedPortForwardProtocols)
 	// negotiated protocol isn't currently used server side, but could be in the future
 	if err != nil {
@@ -46,7 +46,7 @@ func handleHttpStreams(req *http.Request, w http.ResponseWriter, portForwarder P
 	upgrader := spdy.NewResponseUpgrader()
 	conn := upgrader.UpgradeResponse(w, req, httpStreamReceived(streamChan))
 	if conn == nil {
-		return errors.New("Unable to upgrade httpstream connection")
+		return errors.New("unable to upgrade httpstream connection")
 	}
 	defer conn.Close()
 

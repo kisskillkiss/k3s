@@ -29,7 +29,7 @@ import (
 	dockerstrslice "github.com/docker/docker/api/types/strslice"
 	"k8s.io/klog"
 
-	runtimeapi "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 	"k8s.io/kubernetes/pkg/kubelet/dockershim/libdocker"
 )
 
@@ -114,8 +114,9 @@ func (ds *dockerService) CreateContainer(_ context.Context, r *runtimeapi.Create
 	if iSpec := config.GetImage(); iSpec != nil {
 		image = iSpec.Image
 	}
+	containerName := makeContainerName(sandboxConfig, config)
 	createConfig := dockertypes.ContainerCreateConfig{
-		Name: makeContainerName(sandboxConfig, config),
+		Name: containerName,
 		Config: &dockercontainer.Config{
 			// TODO: set User.
 			Entrypoint: dockerstrslice.StrSlice(config.Command),
@@ -136,6 +137,9 @@ func (ds *dockerService) CreateContainer(_ context.Context, r *runtimeapi.Create
 		},
 		HostConfig: &dockercontainer.HostConfig{
 			Binds: generateMountBindings(config.GetMounts()),
+			RestartPolicy: dockercontainer.RestartPolicy{
+				Name: "no",
+			},
 		},
 	}
 
@@ -162,15 +166,33 @@ func (ds *dockerService) CreateContainer(_ context.Context, r *runtimeapi.Create
 
 	hc.SecurityOpt = append(hc.SecurityOpt, securityOpts...)
 
-	createResp, err := ds.client.CreateContainer(createConfig)
+	cleanupInfo, err := ds.applyPlatformSpecificDockerConfig(r, &createConfig)
 	if err != nil {
-		createResp, err = recoverFromCreationConflictIfNeeded(ds.client, createConfig, err)
+		return nil, err
+	}
+
+	createResp, createErr := ds.client.CreateContainer(createConfig)
+	if createErr != nil {
+		createResp, createErr = recoverFromCreationConflictIfNeeded(ds.client, createConfig, createErr)
 	}
 
 	if createResp != nil {
-		return &runtimeapi.CreateContainerResponse{ContainerId: createResp.ID}, nil
+		containerID := createResp.ID
+
+		if cleanupInfo != nil {
+			// we don't perform the clean up just yet at that could destroy information
+			// needed for the container to start (e.g. Windows credentials stored in
+			// registry keys); instead, we'll clean up when the container gets removed
+			ds.containerCleanupInfos[containerID] = cleanupInfo
+		}
+		return &runtimeapi.CreateContainerResponse{ContainerId: containerID}, nil
 	}
-	return nil, err
+
+	// the creation failed, let's clean up right away - we ignore any errors though,
+	// this is best effort
+	ds.performPlatformSpecificContainerCleanupAndLogErrors(containerName, cleanupInfo)
+
+	return nil, createErr
 }
 
 // getContainerLogPath returns the container log path specified by kubelet and the real
@@ -277,10 +299,15 @@ func (ds *dockerService) RemoveContainer(_ context.Context, r *runtimeapi.Remove
 	if err != nil {
 		return nil, err
 	}
+	errors := ds.performPlatformSpecificContainerForContainer(r.ContainerId)
+	if len(errors) != 0 {
+		return nil, fmt.Errorf("failed to run platform-specific clean ups for container %q: %v", r.ContainerId, errors)
+	}
 	err = ds.client.RemoveContainer(r.ContainerId, dockertypes.ContainerRemoveOptions{RemoveVolumes: true, Force: true})
 	if err != nil {
 		return nil, fmt.Errorf("failed to remove container %q: %v", r.ContainerId, err)
 	}
+
 	return &runtimeapi.RemoveContainerResponse{}, nil
 }
 
@@ -426,4 +453,29 @@ func (ds *dockerService) UpdateContainerResources(_ context.Context, r *runtimea
 		return nil, fmt.Errorf("failed to update container %q: %v", r.ContainerId, err)
 	}
 	return &runtimeapi.UpdateContainerResourcesResponse{}, nil
+}
+
+func (ds *dockerService) performPlatformSpecificContainerForContainer(containerID string) (errors []error) {
+	if cleanupInfo, present := ds.containerCleanupInfos[containerID]; present {
+		errors = ds.performPlatformSpecificContainerCleanupAndLogErrors(containerID, cleanupInfo)
+
+		if len(errors) == 0 {
+			delete(ds.containerCleanupInfos, containerID)
+		}
+	}
+
+	return
+}
+
+func (ds *dockerService) performPlatformSpecificContainerCleanupAndLogErrors(containerNameOrID string, cleanupInfo *containerCleanupInfo) []error {
+	if cleanupInfo == nil {
+		return nil
+	}
+
+	errors := ds.performPlatformSpecificContainerCleanup(cleanupInfo)
+	for _, err := range errors {
+		klog.Warningf("error when cleaning up after container %q: %v", containerNameOrID, err)
+	}
+
+	return errors
 }
